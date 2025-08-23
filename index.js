@@ -209,7 +209,7 @@ client.on('messageCreate', async message => {
     return message.reply('You need moderator permissions to use this command.');
   }
 
-  // Add loading reactions
+  // Add loading reactions (if this is removed, it won't affect the code in any way. I just put it here because it's funni :>)
   const loadingEmojis = ['🇱', '🇴', '🇦', '🇩', '🇮', '🇳', '🇬'];
   for (const emoji of loadingEmojis) {
     await message.react(emoji).catch(() => {});
