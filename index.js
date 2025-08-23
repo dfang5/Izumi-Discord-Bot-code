@@ -153,11 +153,11 @@ async function analyzeMutualConnections(targetUser, requestingUser, client) {
         
         // Detect suspicious patterns
         if (joinDiffHours < 24) {
-          suspiciousPatterns.push(`⚠️ Joined ${guild.name} within 24 hours of each other`);
+          suspiciousPatterns.push(`Joined ${guild.name} within 24 hours of each other`);
         }
         
         if (joinDiffHours < 1) {
-          suspiciousPatterns.push(`🚨 Joined ${guild.name} within 1 hour of each other`);
+          suspiciousPatterns.push(`Joined ${guild.name} within 1 hour of each other`);
         }
         
       } catch (error) {
@@ -315,11 +315,11 @@ client.on('interactionCreate', async interaction => {
       // Apply mutual server risk scoring
       if (mutualAnalysis.hasCloseTimingPattern) {
         risk.score += 25;
-        risk.factors.push('🚨 Suspicious mutual server timing patterns');
+        risk.factors.push('Suspicious mutual server timing patterns');
       }
       if (mutualAnalysis.mutualCount === 0) {
         risk.score += 5;
-        risk.factors.push('🌐 No detectable mutual servers');
+        risk.factors.push('No detectable mutual servers');
       }
       
       // Recalculate risk label after mutual analysis
@@ -360,12 +360,12 @@ client.on('interactionCreate', async interaction => {
         .setTitle(`📊 Server Information: ${guild.name}`)
         .setThumbnail(guild.iconURL({ dynamic: true }))
         .addFields(
-          { name: '👑 Owner', value: owner.user.tag, inline: true },
-          { name: '👥 Members', value: guild.memberCount.toString(), inline: true },
-          { name: '📅 Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`, inline: true },
-          { name: '🛡️ Verification Level', value: guild.verificationLevel.toString(), inline: true },
-          { name: '📝 Channels', value: guild.channels.cache.size.toString(), inline: true },
-          { name: '😀 Emojis', value: guild.emojis.cache.size.toString(), inline: true }
+          { name: 'Owner', value: owner.user.tag, inline: true },
+          { name: 'Members', value: guild.memberCount.toString(), inline: true },
+          { name: 'Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`, inline: true },
+          { name: '🛡Verification Level', value: guild.verificationLevel.toString(), inline: true },
+          { name: 'Channels', value: guild.channels.cache.size.toString(), inline: true },
+          { name: 'Emojis', value: guild.emojis.cache.size.toString(), inline: true }
         )
         .setColor(0x5865F2)
         .setTimestamp();
@@ -378,24 +378,24 @@ client.on('interactionCreate', async interaction => {
       const member = await interaction.guild.members.fetch(target.id).catch(() => null);
       
       const embed = new EmbedBuilder()
-        .setTitle(`👤 User Information: ${target.tag}`)
+        .setTitle(`User Information: ${target.tag}`)
         .setThumbnail(target.displayAvatarURL({ dynamic: true }))
         .addFields(
-          { name: '🆔 ID', value: target.id, inline: true },
-          { name: '📅 Account Created', value: `<t:${Math.floor(target.createdTimestamp / 1000)}:D>`, inline: true },
-          { name: '🤖 Bot', value: target.bot ? 'Yes' : 'No', inline: true }
+          { name: 'ID', value: target.id, inline: true },
+          { name: 'Account Created', value: `<t:${Math.floor(target.createdTimestamp / 1000)}:D>`, inline: true },
+          { name: 'Bot', value: target.bot ? 'Yes' : 'No', inline: true }
         )
         .setColor(target.accentColor || 0x5865F2)
         .setTimestamp();
         
       if (member) {
         embed.addFields(
-          { name: '📅 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>`, inline: true },
-          { name: '🎭 Roles', value: member.roles.cache.filter(r => r.id !== interaction.guild.id).map(r => r.name).join(', ') || 'None', inline: false }
+          { name: 'Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>`, inline: true },
+          { name: 'Roles', value: member.roles.cache.filter(r => r.id !== interaction.guild.id).map(r => r.name).join(', ') || 'None', inline: false }
         );
         
         if (member.premiumSince) {
-          embed.addFields({ name: '💎 Boosting Since', value: `<t:${Math.floor(member.premiumSinceTimestamp / 1000)}:D>`, inline: true });
+          embed.addFields({ name: 'Boosting Since', value: `<t:${Math.floor(member.premiumSinceTimestamp / 1000)}:D>`, inline: true });
         }
       }
         
@@ -414,9 +414,9 @@ client.on('interactionCreate', async interaction => {
         .setTitle('📜 Recent Alt Account Checks')
         .setDescription('This feature requires a database to store check history. Currently showing placeholder data.')
         .addFields(
-          { name: '⏰ Last 24 Hours', value: 'No checks recorded', inline: false },
-          { name: '📊 Total Checks', value: 'Database not configured', inline: true },
-          { name: '🎯 High Risk Found', value: 'Database not configured', inline: true }
+          { name: 'Last 24 Hours', value: 'No checks recorded', inline: false },
+          { name: 'Total Checks', value: 'Database not configured', inline: true },
+          { name: 'High Risk Found', value: 'Database not configured', inline: true }
         )
         .setColor(0xFFA500)
         .setTimestamp();
@@ -719,7 +719,7 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     .setTitle('✏️ Message Edited')
     .setColor(0xFFA500)
     .addFields(
-      { name: '👤 Author', value: `${newMessage.author.tag} (${newMessage.author.id})`, inline: true },
+      { name: 'Author', value: `${newMessage.author.tag} (${newMessage.author.id})`, inline: true },
       { name: 'Channel', value: `${newMessage.channel}`, inline: true },
       { name: 'Edited At', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
     )
@@ -727,7 +727,7 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
 
   if (oldMessage.content) {
     embed.addFields({ 
-      name: '📝 Before', 
+      name: 'Before', 
       value: oldMessage.content.length > 512 ? `${oldMessage.content.substring(0, 509)}...` : oldMessage.content,
       inline: false 
     });
@@ -735,14 +735,14 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
 
   if (newMessage.content) {
     embed.addFields({ 
-      name: '📝 After', 
+      name: 'After', 
       value: newMessage.content.length > 512 ? `${newMessage.content.substring(0, 509)}...` : newMessage.content,
       inline: false 
     });
   }
 
   embed.addFields({ 
-    name: '🔗 Jump to Message', 
+    name: 'Jump to Message', 
     value: `[Click here](${newMessage.url})`,
     inline: true 
   });
@@ -778,7 +778,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
   if (!logChannel) return;
   
   const embed = new EmbedBuilder()
-    .setTitle('🎭 Reaction Added')
+    .setTitle('Reaction Added')
     .setColor(0x00FF00)
     .addFields(
       { name: 'User', value: `${user.tag} (${user.id})`, inline: true },
@@ -846,7 +846,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
     const content = reaction.message.content.length > 200 ? 
       `${reaction.message.content.substring(0, 197)}...` : 
       reaction.message.content;
-    embed.addFields({ name: '💬 Message Content', value: content, inline: false });
+    embed.addFields({ name: 'Message Content', value: content, inline: false });
   }
 
   embed.setFooter({ 
