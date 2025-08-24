@@ -23,7 +23,7 @@ async function makeCheckEmbed(user, risk, guild) {
   };
 
   const embed = new EmbedBuilder()
-    .setTitle(`${riskEmojis[risk.label]} Alt Account Detector Analysis:`)
+    .setTitle(`${riskEmojis[risk.label]} Izumi on the case. Here is my report:`)
     .setDescription(`**Target:** ${user.tag} (${user.id})`)
     .setThumbnail(user.displayAvatarURL({ dynamic: true, size: 256 }))
     .setColor(colors[risk.label] || 0x5865F2)
@@ -48,7 +48,7 @@ async function makeCheckEmbed(user, risk, guild) {
     const timeInfo = risk.joinAnalysis.joinDays > 0 ? 
       `${risk.joinAnalysis.joinDays} days ago` : 
       `${risk.joinAnalysis.joinHours} hours ago`;
-    
+
     embed.addFields({
       name: 'Server Credentials:',
       value: `Joined: ${timeInfo}\nRoles: ${risk.joinAnalysis.roles}\nStatus: ${risk.joinAnalysis.permissions}${risk.joinAnalysis.premium ? '\n💎 Server Booster' : ''}`,
@@ -70,7 +70,7 @@ async function makeCheckEmbed(user, risk, guild) {
       value: `Mutual servers: ${mutualInfo.mutualCount}\n${mutualInfo.hasCloseTimingPattern ? '🚨 Suspicious timing patterns detected' : '✅ No suspicious timing patterns'}`,
       inline: true
     });
-    
+
     // Add suspicious patterns if found
     if (mutualInfo.suspiciousPatterns.length > 0) {
       embed.addFields({
@@ -101,29 +101,29 @@ async function makeCheckEmbed(user, risk, guild) {
     });
   }
 
-  // Advanced verdict
+  // Result
   let verdict = '';
   if (risk.score >= 80) {
-    verdict = '**CRITICAL RISK** - Immediate review recommended';
+    verdict = '**CRITICAL RISK** - You should probably do something by this point. Every factor indicates the illegitamacy of this user.'
   } else if (risk.score >= 60) {
-    verdict = '**HIGH RISK** - Close monitoring advised';
+    verdict = '**HIGH RISK** - Keep an eye on this user. There is some strange activity there...';
   } else if (risk.score >= 35) {
-    verdict = '**MEDIUM RISK** - Proceed with caution';
+    verdict = '**MEDIUM RISK** - They might be hiding something. I suggest you have a further look.';
   } else if (risk.score >= 15) {
-    verdict = '**LOW RISK** - Appears legitimate';
+    verdict = '**LOW RISK** - Eh, it seems fine. Maybe check this user occasionally. Who knows what they might be hiding?';
   } else {
-    verdict = '**MINIMAL RISK** - Highly likely legitimate';
+    verdict = '**MINIMAL RISK** - This user seems legitimate. You can trust them. Probably.';
   }
 
   embed.addFields({
-    name: '📋 Final Assessment',
+    name: 'Final Assessment',
     value: verdict,
     inline: false
   });
 
   // Enhanced footer
   embed.setFooter({ 
-    text: `Analysis: ${risk.riskIndicators} risk factors • ${risk.legitimacyIndicators} positive signs • Checked by Alt Account Detector`,
+    text: `Analysis: ${risk.riskIndicators} risk factors • ${risk.legitimacyIndicators} positive signs • Checked by Izumi - Your full-time detective.`,
     iconURL: user.displayAvatarURL({ dynamic: true })
   });
 
