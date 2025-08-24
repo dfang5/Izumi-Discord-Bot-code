@@ -24,11 +24,11 @@ const commands = [
       option.setName('user')
         .setDescription('The user to check')
         .setRequired(true)),
-  
+
   new SlashCommandBuilder()
     .setName('serverinfo')
     .setDescription('Get information about the current server'),
-    
+
   new SlashCommandBuilder()
     .setName('userinfo')
     .setDescription('Get detailed information about a user')
@@ -36,7 +36,7 @@ const commands = [
       option.setName('user')
         .setDescription('The user to get info about')
         .setRequired(false)),
-        
+
   new SlashCommandBuilder()
     .setName('althistory')
     .setDescription('View recent alt account checks in this server')
@@ -45,25 +45,53 @@ const commands = [
         .setDescription('Number of recent checks to show (1-10)')
         .setMinValue(1)
         .setMaxValue(10)),
-        
+
   new SlashCommandBuilder()
     .setName('setreactionlogs')
     .setDescription('Configure reaction logging channel (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-    
+
   new SlashCommandBuilder()
     .setName('setdeletedlogs')
     .setDescription('Configure deleted message logging channel (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-    
+
   new SlashCommandBuilder()
     .setName('seteditlogs')
     .setDescription('Configure message edit logging channel (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-    
+
   new SlashCommandBuilder()
     .setName('logstatus')
     .setDescription('View current logging configuration (Moderator only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('say')
+    .setDescription('Send a message to a specified channel (Admin only)')
+    .addChannelOption(option =>
+      option.setName('channel')
+        .setDescription('The channel to send the message to')
+        .addChannelTypes(ChannelType.GuildText)
+        .setRequired(true))
+    .addStringOption(option =>
+      option.setName('message')
+        .setDescription('The message to send')
+        .setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('riskreport')
+    .setDescription('Generate a comprehensive server security and safety assessment')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('behavioursummary')
+    .setDescription('Analyze a user\'s activity patterns and message history')
+    .addUserOption(option => 
+      option.setName('user')
+        .setDescription('The user to analyze')
+        .setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
 ];
 
@@ -119,7 +147,7 @@ function createChannelSelectMenu(guildId, logType) {
 async function analyzeMutualConnections(targetUser, requestingUser, client) {
   const mutualConnections = [];
   const suspiciousPatterns = [];
-  
+
   try {
     // Get mutual guilds (limited by Discord API)
     const mutualGuilds = client.guilds.cache.filter(guild => {
@@ -134,11 +162,11 @@ async function analyzeMutualConnections(targetUser, requestingUser, client) {
       try {
         const targetMember = await guild.members.fetch(targetUser.id);
         const requestingMember = await guild.members.fetch(requestingUser.id);
-        
+
         // Analyze join timing patterns
         const joinTimeDiff = Math.abs(targetMember.joinedTimestamp - requestingMember.joinedTimestamp);
         const joinDiffHours = joinTimeDiff / (1000 * 60 * 60);
-        
+
         const connectionData = {
           guildName: guild.name,
           guildId: guild.id,
@@ -148,30 +176,30 @@ async function analyzeMutualConnections(targetUser, requestingUser, client) {
           targetRoles: targetMember.roles.cache.size - 1,
           bothHaveRoles: (targetMember.roles.cache.size > 1) && (requestingMember.roles.cache.size > 1)
         };
-        
+
         mutualConnections.push(connectionData);
-        
+
         // Detect suspicious patterns
         if (joinDiffHours < 24) {
-          suspiciousPatterns.push(`Joined ${guild.name} within 24 hours of each other`);
+          suspiciousPatterns.push(`⚠️ Joined ${guild.name} within 24 hours of each other`);
         }
-        
+
         if (joinDiffHours < 1) {
-          suspiciousPatterns.push(`Joined ${guild.name} within 1 hour of each other`);
+          suspiciousPatterns.push(`🚨 Joined ${guild.name} within 1 hour of each other`);
         }
-        
+
       } catch (error) {
         // Skip if can't fetch members
       }
     }
-    
+
     return {
       mutualCount: mutualConnections.length,
       connections: mutualConnections.slice(0, 5), // Limit to 5 for display
       suspiciousPatterns: suspiciousPatterns,
       hasCloseTimingPattern: suspiciousPatterns.some(p => p.includes('hour'))
     };
-    
+
   } catch (error) {
     return {
       mutualCount: 0,
@@ -185,10 +213,10 @@ async function analyzeMutualConnections(targetUser, requestingUser, client) {
 // ✅ Bot login and slash command registration
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  
+
   // Register slash commands
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-  
+
   try {
     console.log('🔄 Registering slash commands...');
     await rest.put(
@@ -203,13 +231,96 @@ client.once('ready', async () => {
 
 // ✅ Message command handler with loading reactions
 client.on('messageCreate', async message => {
-  if (!message.content.startsWith('!check') || message.author.bot) return;
+  if (message.author.bot) return;
+
+  // Handle !riskreport command
+  if (message.content.startsWith('!riskreport')) {
+    if (!isModerator(message.member)) {
+      return message.reply('You need moderator permissions to use this command.');
+    }
+
+    // Add loading reactions
+    const loadingEmojis = ['🔍', '📊', '🛡️', '⚡', '📋'];
+    for (const emoji of loadingEmojis) {
+      await message.react(emoji).catch(() => {});
+    }
+
+    try {
+      const report = await generateServerRiskReport(message.guild, message.author);
+      const embed = await createRiskReportEmbed(report, message.guild);
+
+      // Remove loading reactions
+      for (const emoji of loadingEmojis) {
+        await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
+      }
+
+      return message.reply({ embeds: [embed] });
+    } catch (error) {
+      console.error('Error generating risk report:', error);
+      // Remove loading reactions
+      for (const emoji of loadingEmojis) {
+        await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
+      }
+      return message.reply('❌ Error generating server risk report. Please try again.');
+    }
+  }
+
+  // Handle !behavioursummary command
+  if (message.content.startsWith('!behavioursummary')) {
+    if (!isModerator(message.member)) {
+      return message.reply('You need moderator permissions to use this command.');
+    }
+
+    const args = message.content.split(' ').slice(1);
+    let target;
+
+    if (message.mentions.users.size > 0) {
+      target = message.mentions.users.first();
+    } else if (args[0]) {
+      try {
+        target = await client.users.fetch(args[0]);
+      } catch {
+        return message.reply('❌ Could not find a user with that ID.');
+      }
+    }
+
+    if (!target) {
+      return message.reply('Please mention a user or provide a valid user ID.');
+    }
+
+    // Add loading reactions
+    const loadingEmojis = ['📊', '📈', '🔍', '📋', '⏳'];
+    for (const emoji of loadingEmojis) {
+      await message.react(emoji).catch(() => {});
+    }
+
+    try {
+      const behaviorData = await analyzeBehaviorSummary(target, message.guild);
+      const embeds = await createBehaviorSummaryEmbeds(behaviorData, target, message.guild);
+
+      // Remove loading reactions
+      for (const emoji of loadingEmojis) {
+        await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
+      }
+
+      return message.reply({ embeds });
+    } catch (error) {
+      console.error('Error generating behavior summary:', error);
+      // Remove loading reactions
+      for (const emoji of loadingEmojis) {
+        await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
+      }
+      return message.reply('❌ Error generating behavior summary. Please try again.');
+    }
+  }
+
+  if (!message.content.startsWith('!check')) return;
 
   if (!isModerator(message.member)) {
     return message.reply('You need moderator permissions to use this command.');
   }
 
-  // Add loading reactions (if this is removed, it won't affect the code in any way. I just put it here because it's funni :>)
+  // Add loading reactions
   const loadingEmojis = ['🇱', '🇴', '🇦', '🇩', '🇮', '🇳', '🇬'];
   for (const emoji of loadingEmojis) {
     await message.react(emoji).catch(() => {});
@@ -241,11 +352,11 @@ client.on('messageCreate', async message => {
   }
 
   const risk = await calculateRisk(target, message.guild);
-  
+
   // Add mutual server analysis
   const mutualAnalysis = await analyzeMutualConnections(target, message.author, client);
   risk.mutualAnalysis = mutualAnalysis;
-  
+
   // Apply mutual server risk scoring
   if (mutualAnalysis.hasCloseTimingPattern) {
     risk.score += 25;
@@ -255,7 +366,7 @@ client.on('messageCreate', async message => {
     risk.score += 5;
     risk.factors.push('No detectable mutual servers');
   }
-  
+
   // Recalculate risk label after mutual analysis
   risk.score = Math.max(0, Math.min(100, risk.score));
   if (risk.score >= 80) risk.label = 'Critical';
@@ -263,7 +374,7 @@ client.on('messageCreate', async message => {
   else if (risk.score >= 35) risk.label = 'Medium';
   else if (risk.score >= 15) risk.label = 'Low';
   else risk.label = 'Minimal';
-  
+
   const embed = await makeCheckEmbed(target, risk, message.guild);
 
   // Check if target is admin (immune to moderation)
@@ -304,24 +415,24 @@ client.on('interactionCreate', async interaction => {
       }
 
       await interaction.deferReply();
-      
+
       const target = interaction.options.getUser('user');
       const risk = await calculateRisk(target, interaction.guild);
-      
+
       // Add mutual server analysis
       const mutualAnalysis = await analyzeMutualConnections(target, interaction.user, client);
       risk.mutualAnalysis = mutualAnalysis;
-      
+
       // Apply mutual server risk scoring
       if (mutualAnalysis.hasCloseTimingPattern) {
         risk.score += 25;
-        risk.factors.push('Suspicious mutual server timing patterns');
+        risk.factors.push('🚨 Suspicious mutual server timing patterns');
       }
       if (mutualAnalysis.mutualCount === 0) {
         risk.score += 5;
-        risk.factors.push('No detectable mutual servers');
+        risk.factors.push('🌐 No detectable mutual servers');
       }
-      
+
       // Recalculate risk label after mutual analysis
       risk.score = Math.max(0, Math.min(100, risk.score));
       if (risk.score >= 80) risk.label = 'Critical';
@@ -329,7 +440,7 @@ client.on('interactionCreate', async interaction => {
       else if (risk.score >= 35) risk.label = 'Medium';
       else if (risk.score >= 15) risk.label = 'Low';
       else risk.label = 'Minimal';
-      
+
       const embed = await makeCheckEmbed(target, risk, interaction.guild);
 
       const targetMember = await interaction.guild.members.fetch(target.id).catch(() => null);
@@ -355,50 +466,50 @@ client.on('interactionCreate', async interaction => {
     if (commandName === 'serverinfo') {
       const guild = interaction.guild;
       const owner = await guild.fetchOwner();
-      
+
       const embed = new EmbedBuilder()
         .setTitle(`📊 Server Information: ${guild.name}`)
         .setThumbnail(guild.iconURL({ dynamic: true }))
         .addFields(
-          { name: 'Owner', value: owner.user.tag, inline: true },
-          { name: 'Members', value: guild.memberCount.toString(), inline: true },
-          { name: 'Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`, inline: true },
-          { name: '🛡Verification Level', value: guild.verificationLevel.toString(), inline: true },
-          { name: 'Channels', value: guild.channels.cache.size.toString(), inline: true },
-          { name: 'Emojis', value: guild.emojis.cache.size.toString(), inline: true }
+          { name: '👑 Owner', value: owner.user.tag, inline: true },
+          { name: '👥 Members', value: guild.memberCount.toString(), inline: true },
+          { name: '📅 Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`, inline: true },
+          { name: '🛡️ Verification Level', value: guild.verificationLevel.toString(), inline: true },
+          { name: '📝 Channels', value: guild.channels.cache.size.toString(), inline: true },
+          { name: '😀 Emojis', value: guild.emojis.cache.size.toString(), inline: true }
         )
         .setColor(0x5865F2)
         .setTimestamp();
-        
+
       return interaction.reply({ embeds: [embed] });
     }
 
     if (commandName === 'userinfo') {
       const target = interaction.options.getUser('user') || interaction.user;
       const member = await interaction.guild.members.fetch(target.id).catch(() => null);
-      
+
       const embed = new EmbedBuilder()
-        .setTitle(`User Information: ${target.tag}`)
+        .setTitle(`👤 User Information: ${target.tag}`)
         .setThumbnail(target.displayAvatarURL({ dynamic: true }))
         .addFields(
-          { name: 'ID', value: target.id, inline: true },
-          { name: 'Account Created', value: `<t:${Math.floor(target.createdTimestamp / 1000)}:D>`, inline: true },
-          { name: 'Bot', value: target.bot ? 'Yes' : 'No', inline: true }
+          { name: '🆔 ID', value: target.id, inline: true },
+          { name: '📅 Account Created', value: `<t:${Math.floor(target.createdTimestamp / 1000)}:D>`, inline: true },
+          { name: '🤖 Bot', value: target.bot ? 'Yes' : 'No', inline: true }
         )
         .setColor(target.accentColor || 0x5865F2)
         .setTimestamp();
-        
+
       if (member) {
         embed.addFields(
-          { name: 'Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>`, inline: true },
-          { name: 'Roles', value: member.roles.cache.filter(r => r.id !== interaction.guild.id).map(r => r.name).join(', ') || 'None', inline: false }
+          { name: '📅 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>`, inline: true },
+          { name: '🎭 Roles', value: member.roles.cache.filter(r => r.id !== interaction.guild.id).map(r => r.name).join(', ') || 'None', inline: false }
         );
-        
+
         if (member.premiumSince) {
-          embed.addFields({ name: 'Boosting Since', value: `<t:${Math.floor(member.premiumSinceTimestamp / 1000)}:D>`, inline: true });
+          embed.addFields({ name: '💎 Boosting Since', value: `<t:${Math.floor(member.premiumSinceTimestamp / 1000)}:D>`, inline: true });
         }
       }
-        
+
       return interaction.reply({ embeds: [embed] });
     }
 
@@ -406,21 +517,21 @@ client.on('interactionCreate', async interaction => {
       if (!isModerator(interaction.member)) {
         return interaction.reply({ content: '🚫 You need moderator permissions to use this command.', ephemeral: false });
       }
-      
+
       const limit = interaction.options.getInteger('limit') || 5;
-      
+
       // This is a placeholder - in a real implementation you'd store check history in a database
       const embed = new EmbedBuilder()
         .setTitle('📜 Recent Alt Account Checks')
         .setDescription('This feature requires a database to store check history. Currently showing placeholder data.')
         .addFields(
-          { name: 'Last 24 Hours', value: 'No checks recorded', inline: false },
-          { name: 'Total Checks', value: 'Database not configured', inline: true },
-          { name: 'High Risk Found', value: 'Database not configured', inline: true }
+          { name: '⏰ Last 24 Hours', value: 'No checks recorded', inline: false },
+          { name: '📊 Total Checks', value: 'Database not configured', inline: true },
+          { name: '🎯 High Risk Found', value: 'Database not configured', inline: true }
         )
         .setColor(0xFFA500)
         .setTimestamp();
-        
+
       return interaction.reply({ embeds: [embed], ephemeral: false });
     }
 
@@ -502,6 +613,74 @@ client.on('interactionCreate', async interaction => {
 
       return interaction.reply({ embeds: [embed], ephemeral: false });
     }
+
+    if (commandName === 'say') {
+      if (!isAdmin(interaction.member)) {
+        return interaction.reply({ content: '🚫 You need administrator permissions to use this command.', ephemeral: true });
+      }
+
+      const targetChannel = interaction.options.getChannel('channel');
+      const messageText = interaction.options.getString('message');
+
+      // Verify the channel is a text channel in the same guild
+      if (!targetChannel || targetChannel.type !== ChannelType.GuildText || targetChannel.guild.id !== interaction.guild.id) {
+        return interaction.reply({ content: '❌ Invalid channel selected. Please choose a text channel from this server.', ephemeral: true });
+      }
+
+      try {
+        // Send the message to the target channel
+        await targetChannel.send(messageText);
+
+        return interaction.reply({ 
+          content: `✅ Message sent to ${targetChannel}`, 
+          ephemeral: true 
+        });
+      } catch (error) {
+        console.error('Error sending message:', error);
+        return interaction.reply({ 
+          content: '❌ Failed to send message. Check bot permissions for that channel.', 
+          ephemeral: true 
+        });
+      }
+    }
+
+    if (commandName === 'riskreport') {
+      if (!isModerator(interaction.member)) {
+        return interaction.reply({ content: '🚫 You need moderator permissions to use this command.', ephemeral: false });
+      }
+
+      await interaction.deferReply();
+
+      try {
+        const report = await generateServerRiskReport(interaction.guild, interaction.user);
+        const embed = await createRiskReportEmbed(report, interaction.guild);
+
+        return interaction.editReply({ embeds: [embed] });
+      } catch (error) {
+        console.error('Error generating risk report:', error);
+        return interaction.editReply({ content: '❌ Error generating server risk report. Please try again.' });
+      }
+    }
+
+    if (commandName === 'behavioursummary') {
+      if (!isModerator(interaction.member)) {
+        return interaction.reply({ content: '🚫 You need moderator permissions to use this command.', ephemeral: false });
+      }
+
+      await interaction.deferReply();
+
+      const target = interaction.options.getUser('user');
+
+      try {
+        const behaviorData = await analyzeBehaviorSummary(target, interaction.guild);
+        const embeds = await createBehaviorSummaryEmbeds(behaviorData, target, interaction.guild);
+
+        return interaction.editReply({ embeds });
+      } catch (error) {
+        console.error('Error generating behavior summary:', error);
+        return interaction.editReply({ content: '❌ Error generating behavior summary. Please try again.' });
+      }
+    }
   }
 
   // ✅ Select menu interaction handler
@@ -510,7 +689,7 @@ client.on('interactionCreate', async interaction => {
     const action = customIdParts[0];
     const logType = customIdParts[1];
     const guildId = customIdParts[3];
-    
+
     if (action === 'select' && guildId === interaction.guild.id) {
       if (!isAdmin(interaction.member)) {
         return interaction.reply({ content: '🚫 You need administrator permissions to configure logging.', ephemeral: false });
@@ -527,7 +706,7 @@ client.on('interactionCreate', async interaction => {
       if (logType === 'reaction') {
         config.reactionLogsChannel = channelId;
         serverConfigs.set(guildId, config);
-        
+
         return interaction.update({ 
           content: `✅ Reaction logs configured for ${channel}`, 
           embeds: [], 
@@ -536,7 +715,7 @@ client.on('interactionCreate', async interaction => {
       } else if (logType === 'deleted') {
         config.deletedLogsChannel = channelId;
         serverConfigs.set(guildId, config);
-        
+
         return interaction.update({ 
           content: `✅ Deleted message logs configured for ${channel}`, 
           embeds: [], 
@@ -545,7 +724,7 @@ client.on('interactionCreate', async interaction => {
       } else if (logType === 'edit') {
         config.editLogsChannel = channelId;
         serverConfigs.set(guildId, config);
-        
+
         return interaction.update({ 
           content: `✅ Message edit logs configured for ${channel}`, 
           embeds: [], 
@@ -578,7 +757,7 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: '🚫 You do not have permission to kick.', ephemeral: false });
     }
     if (!member) return interaction.reply({ content: '⚠️ User is not in the server.', ephemeral: false });
-    
+
     if (isTargetAdmin) {
       return interaction.reply({ content: '🛡️ Cannot kick this user - they have administrator privileges.', ephemeral: false });
     }
@@ -600,7 +779,7 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: '🚫 You do not have permission to ban.', ephemeral: false });
     }
     if (!member) return interaction.reply({ content: '⚠️ User is not in the server.', ephemeral: false });
-    
+
     if (isTargetAdmin) {
       return interaction.reply({ content: '🛡️ Cannot ban this user - they have administrator privileges.', ephemeral: false });
     }
@@ -636,10 +815,10 @@ client.on('interactionCreate', async interaction => {
   if (action === 'cancel') {
     return interaction.update({ content: '❎ Action cancelled.', components: [] });
   }
-  
+
   } catch (error) {
     console.error('Error handling interaction:', error);
-    
+
     if (!interaction.replied && !interaction.deferred) {
       try {
         await interaction.reply({ content: '❌ An error occurred while processing your request.', ephemeral: true });
@@ -660,13 +839,13 @@ client.on('interactionCreate', async interaction => {
 client.on('messageDelete', async message => {
   // Ignore bot messages and system messages
   if (!message.author || message.author.bot || message.system) return;
-  
+
   const config = getServerConfig(message.guild.id);
   if (!config.deletedLogsChannel) return;
-  
+
   const logChannel = message.guild.channels.cache.get(config.deletedLogsChannel);
   if (!logChannel) return;
-  
+
   const embed = new EmbedBuilder()
     .setTitle('Message Deleted')
     .setColor(0xFF0000)
@@ -708,18 +887,18 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
   // Ignore bot messages, system messages, and messages without content changes
   if (!newMessage.author || newMessage.author.bot || newMessage.system) return;
   if (oldMessage.content === newMessage.content) return; // No content change
-  
+
   const config = getServerConfig(newMessage.guild.id);
   if (!config.editLogsChannel) return;
-  
+
   const logChannel = newMessage.guild.channels.cache.get(config.editLogsChannel);
   if (!logChannel) return;
-  
+
   const embed = new EmbedBuilder()
     .setTitle('✏️ Message Edited')
     .setColor(0xFFA500)
     .addFields(
-      { name: 'Author', value: `${newMessage.author.tag} (${newMessage.author.id})`, inline: true },
+      { name: '👤 Author', value: `${newMessage.author.tag} (${newMessage.author.id})`, inline: true },
       { name: 'Channel', value: `${newMessage.channel}`, inline: true },
       { name: 'Edited At', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
     )
@@ -727,7 +906,7 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
 
   if (oldMessage.content) {
     embed.addFields({ 
-      name: 'Before', 
+      name: '📝 Before', 
       value: oldMessage.content.length > 512 ? `${oldMessage.content.substring(0, 509)}...` : oldMessage.content,
       inline: false 
     });
@@ -735,14 +914,14 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
 
   if (newMessage.content) {
     embed.addFields({ 
-      name: 'After', 
+      name: '📝 After', 
       value: newMessage.content.length > 512 ? `${newMessage.content.substring(0, 509)}...` : newMessage.content,
       inline: false 
     });
   }
 
   embed.addFields({ 
-    name: 'Jump to Message', 
+    name: '🔗 Jump to Message', 
     value: `[Click here](${newMessage.url})`,
     inline: true 
   });
@@ -760,7 +939,7 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
 client.on('messageReactionAdd', async (reaction, user) => {
   // Ignore bot reactions
   if (user.bot) return;
-  
+
   // Fetch partial reactions
   if (reaction.partial) {
     try {
@@ -773,12 +952,12 @@ client.on('messageReactionAdd', async (reaction, user) => {
 
   const config = getServerConfig(reaction.message.guild.id);
   if (!config.reactionLogsChannel) return;
-  
+
   const logChannel = reaction.message.guild.channels.cache.get(config.reactionLogsChannel);
   if (!logChannel) return;
-  
+
   const embed = new EmbedBuilder()
-    .setTitle('Reaction Added')
+    .setTitle('🎭 Reaction Added')
     .setColor(0x00FF00)
     .addFields(
       { name: 'User', value: `${user.tag} (${user.id})`, inline: true },
@@ -812,7 +991,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
 client.on('messageReactionRemove', async (reaction, user) => {
   // Ignore bot reactions
   if (user.bot) return;
-  
+
   // Fetch partial reactions
   if (reaction.partial) {
     try {
@@ -825,10 +1004,10 @@ client.on('messageReactionRemove', async (reaction, user) => {
 
   const config = getServerConfig(reaction.message.guild.id);
   if (!config.reactionLogsChannel) return;
-  
+
   const logChannel = reaction.message.guild.channels.cache.get(config.reactionLogsChannel);
   if (!logChannel) return;
-  
+
   const embed = new EmbedBuilder()
     .setTitle('Reaction Removed')
     .setColor(0xFF4444)
@@ -846,7 +1025,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
     const content = reaction.message.content.length > 200 ? 
       `${reaction.message.content.substring(0, 197)}...` : 
       reaction.message.content;
-    embed.addFields({ name: 'Message Content', value: content, inline: false });
+    embed.addFields({ name: '💬 Message Content', value: content, inline: false });
   }
 
   embed.setFooter({ 
@@ -859,5 +1038,622 @@ client.on('messageReactionRemove', async (reaction, user) => {
     console.error('Error sending reaction removal log:', error);
   }
 });
+
+// ✅ Server Risk Assessment Functions
+async function generateServerRiskReport(guild, requestingUser) {
+  const report = {
+    serverInfo: {
+      name: guild.name,
+      memberCount: guild.memberCount,
+      createdAt: guild.createdTimestamp,
+      verificationLevel: guild.verificationLevel,
+      hasIcon: !!guild.icon,
+      hasBanner: !!guild.banner
+    },
+    suspiciousUsers: [],
+    massJoinEvents: [],
+    securityMetrics: {
+      totalMembers: 0,
+      newAccounts: 0,
+      highRiskUsers: 0,
+      mediumRiskUsers: 0,
+      lowRiskUsers: 0,
+      averageRiskScore: 0,
+      inviteSpammers: 0,
+      everyoneMentioners: 0,
+      advertisementPosters: 0
+    },
+    serverSafetyScore: 0,
+    moderationLevel: 'Unknown',
+    recommendations: []
+  };
+
+  try {
+    // Fetch all members (limited by Discord API)
+    const members = await guild.members.fetch({ limit: 1000 });
+    report.securityMetrics.totalMembers = members.size;
+
+    const memberRisks = [];
+    const joinTimes = [];
+    const suspiciousPatterns = new Map();
+
+    // Analyze each member
+    for (const [memberId, member] of members) {
+      if (member.user.bot) continue;
+
+      const risk = await calculateRisk(member.user, guild);
+      memberRisks.push(risk.score);
+      joinTimes.push(member.joinedTimestamp);
+
+      // Categorize risk levels
+      if (risk.score >= 60) {
+        report.securityMetrics.highRiskUsers++;
+        report.suspiciousUsers.push({
+          user: member.user,
+          riskScore: risk.score,
+          riskLevel: risk.label,
+          factors: risk.factors.slice(0, 3),
+          joinedAt: member.joinedTimestamp
+        });
+      } else if (risk.score >= 35) {
+        report.securityMetrics.mediumRiskUsers++;
+      } else {
+        report.securityMetrics.lowRiskUsers++;
+      }
+
+      // Check for new accounts
+      const accountAge = Date.now() - member.user.createdTimestamp;
+      if (accountAge < 7 * 24 * 60 * 60 * 1000) { // 7 days
+        report.securityMetrics.newAccounts++;
+      }
+
+      // Detect mass join patterns
+      const joinHour = new Date(member.joinedTimestamp).getHours();
+      const joinKey = `${new Date(member.joinedTimestamp).toDateString()}_${joinHour}`;
+      if (!suspiciousPatterns.has(joinKey)) {
+        suspiciousPatterns.set(joinKey, []);
+      }
+      suspiciousPatterns.get(joinKey).push({
+        user: member.user,
+        joinTime: member.joinedTimestamp
+      });
+    }
+
+    // Detect mass join events
+    for (const [timeKey, users] of suspiciousPatterns) {
+      if (users.length >= 5) { // 5+ users joined in same hour
+        report.massJoinEvents.push({
+          timeframe: timeKey,
+          userCount: users.length,
+          users: users.slice(0, 5) // Show first 5
+        });
+      }
+    }
+
+    // Calculate average risk score
+    if (memberRisks.length > 0) {
+      report.securityMetrics.averageRiskScore = Math.round(
+        memberRisks.reduce((sum, score) => sum + score, 0) / memberRisks.length
+      );
+    }
+
+    // Analyze server configuration
+    const serverConfigScore = analyzeServerConfiguration(guild);
+    
+    // Calculate overall server safety score
+    const riskPenalty = (report.securityMetrics.highRiskUsers * 15) + 
+                       (report.securityMetrics.mediumRiskUsers * 5) +
+                       (report.massJoinEvents.length * 10);
+    
+    const baseScore = Math.max(0, 100 - riskPenalty);
+    report.serverSafetyScore = Math.min(100, Math.max(0, baseScore + serverConfigScore));
+
+    // Determine moderation level
+    if (report.serverSafetyScore >= 85) {
+      report.moderationLevel = 'Excellent';
+    } else if (report.serverSafetyScore >= 70) {
+      report.moderationLevel = 'Good';
+    } else if (report.serverSafetyScore >= 50) {
+      report.moderationLevel = 'Moderate';
+    } else if (report.serverSafetyScore >= 30) {
+      report.moderationLevel = 'Poor';
+    } else {
+      report.moderationLevel = 'Critical';
+    }
+
+    // Generate recommendations
+    generateRecommendations(report);
+
+    // Sort suspicious users by risk score
+    report.suspiciousUsers.sort((a, b) => b.riskScore - a.riskScore);
+    report.suspiciousUsers = report.suspiciousUsers.slice(0, 10); // Limit to top 10
+
+  } catch (error) {
+    console.error('Error generating server risk report:', error);
+    throw error;
+  }
+
+  return report;
+}
+
+function analyzeServerConfiguration(guild) {
+  let score = 0;
+
+  // Verification level bonus
+  if (guild.verificationLevel >= 3) score += 15;
+  else if (guild.verificationLevel >= 2) score += 10;
+  else if (guild.verificationLevel >= 1) score += 5;
+
+  // Server age bonus
+  const serverAge = Date.now() - guild.createdTimestamp;
+  const ageDays = Math.floor(serverAge / (1000 * 60 * 60 * 24));
+  if (ageDays > 365) score += 10;
+  else if (ageDays > 90) score += 5;
+
+  // Server branding bonus
+  if (guild.icon) score += 3;
+  if (guild.banner) score += 2;
+
+  // Role structure analysis
+  const roleCount = guild.roles.cache.size;
+  if (roleCount > 10) score += 5;
+  else if (roleCount > 5) score += 3;
+
+  return Math.min(20, score); // Cap at 20 points
+}
+
+function generateRecommendations(report) {
+  const recommendations = [];
+
+  if (report.securityMetrics.highRiskUsers > 5) {
+    recommendations.push('Not looking good for your server. There is a lot of risky users out there. Consider reviewing the member verification process.');
+  }
+
+  if (report.massJoinEvents.length > 2) {
+    recommendations.push('There has been a lot of mass-join events recently. Are you sure your server is safe? Enable member verification or screening.');
+  }
+
+  if (report.securityMetrics.newAccounts > report.securityMetrics.totalMembers * 0.3) {
+    recommendations.push('Yeesh, I detect a lot of new accounts joining this server. Consider implementing the minimum account age requirements.');
+  }
+
+  if (report.serverSafetyScore < 50) {
+    recommendations.push('Low server safety score. Review moderation settings and consider additional security measures.');
+  }
+
+  if (report.serverInfo.verificationLevel < 2) {
+    recommendations.push('Consider increasing server verification level for better security.');
+  }
+
+  if (recommendations.length === 0) {
+    recommendations.push('✅ You have pretty great security going on in your server. keep it up :>');
+  }
+
+  report.recommendations = recommendations.slice(0, 5); // Limit to 5 recommendations
+}
+
+async function createRiskReportEmbed(report, guild) {
+  const colors = {
+    'Excellent': 0x00FF00,
+    'Good': 0x90EE90,
+    'Moderate': 0xFFFF00,
+    'Poor': 0xFF6600,
+    'Critical': 0xFF0000
+  };
+
+  const embed = new EmbedBuilder()
+    .setTitle('Server Security & Safety Report')
+    .setDescription(`**${guild.name}** Security Assessment`)
+    .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
+    .setColor(colors[report.moderationLevel] || 0x5865F2)
+    .setTimestamp();
+
+  // Overall metrics
+  embed.addFields(
+    { name: 'Safety Score', value: `**${report.serverSafetyScore}/100**`, inline: true },
+    { name: 'Moderation Level', value: report.moderationLevel, inline: true },
+    { name: 'Average Risk', value: `${report.securityMetrics.averageRiskScore}/100`, inline: true }
+  );
+
+  // Member analysis
+  embed.addFields(
+    { name: 'Total Members', value: report.securityMetrics.totalMembers.toString(), inline: true },
+    { name: 'High Risk', value: report.securityMetrics.highRiskUsers.toString(), inline: true },
+    { name: 'Medium Risk', value: report.securityMetrics.mediumRiskUsers.toString(), inline: true }
+  );
+
+  // Security indicators
+  embed.addFields(
+    { name: 'New Accounts (< 7d)', value: report.securityMetrics.newAccounts.toString(), inline: true },
+    { name: 'Mass Join Events', value: report.massJoinEvents.length.toString(), inline: true },
+    { name: 'Verification Level', value: report.serverInfo.verificationLevel.toString(), inline: true }
+  );
+
+  // Suspicious users (if any)
+  if (report.suspiciousUsers.length > 0) {
+    const suspiciousText = report.suspiciousUsers.slice(0, 5).map(user => 
+      `**${user.user.tag}** (${user.riskScore}/100) - ${user.riskLevel}`
+    ).join('\n');
+    
+    embed.addFields({
+      name: 'Suspicious Users:',
+      value: suspiciousText,
+      inline: false
+    });
+  }
+
+  // Mass join events (if any)
+  if (report.massJoinEvents.length > 0) {
+    const massJoinText = report.massJoinEvents.slice(0, 3).map(event => 
+      `**${event.userCount} users** joined during ${event.timeframe.split('_')[0]}`
+    ).join('\n');
+    
+    embed.addFields({
+      name: 'Recent Mass Join Events',
+      value: massJoinText,
+      inline: false
+    });
+  }
+
+  // Recommendations
+  if (report.recommendations.length > 0) {
+    embed.addFields({
+      name: 'Security Recommendations',
+      value: report.recommendations.join('\n'),
+      inline: false
+    });
+  }
+
+  embed.setFooter({ 
+    text: `Report generated • ${report.securityMetrics.highRiskUsers + report.securityMetrics.mediumRiskUsers} potentially risky users identified`,
+    iconURL: guild.iconURL({ dynamic: true })
+  });
+
+  return embed;
+}
+
+// ✅ Behavior Analysis Functions
+async function analyzeBehaviorSummary(user, guild) {
+  const behaviorData = {
+    userInfo: {
+      id: user.id,
+      tag: user.tag,
+      joinedAt: null,
+      accountCreated: user.createdTimestamp
+    },
+    messageStats: {
+      totalMessages: 0,
+      totalLinks: 0,
+      totalMentions: 0,
+      averageMessagesPerDay: 0,
+      peakActivityDay: null,
+      peakActivityCount: 0
+    },
+    activityTimeline: [],
+    suspiciousSpikes: [],
+    dailyActivity: new Map(),
+    analysis: {
+      mostActiveHour: null,
+      mostActiveDay: null,
+      consistencyScore: 0,
+      activityPattern: 'Unknown'
+    }
+  };
+
+  try {
+    // Get member information
+    const member = await guild.members.fetch(user.id);
+    behaviorData.userInfo.joinedAt = member.joinedTimestamp;
+
+    // Calculate days since joining
+    const daysSinceJoin = Math.floor((Date.now() - member.joinedTimestamp) / (1000 * 60 * 60 * 24));
+    const startDate = new Date(member.joinedTimestamp);
+
+    // Initialize daily activity tracking
+    for (let i = 0; i <= daysSinceJoin; i++) {
+      const date = new Date(startDate.getTime() + (i * 24 * 60 * 60 * 1000));
+      const dateKey = date.toISOString().split('T')[0];
+      behaviorData.dailyActivity.set(dateKey, {
+        date: dateKey,
+        messages: 0,
+        links: 0,
+        mentions: 0,
+        timestamp: date.getTime()
+      });
+    }
+
+    // Fetch messages from all accessible channels
+    const channels = guild.channels.cache.filter(channel => 
+      channel.type === 0 && // Text channels
+      channel.permissionsFor(guild.members.me).has('ReadMessageHistory')
+    );
+
+    console.log(`Analyzing ${channels.size} channels for user ${user.tag}...`);
+
+    for (const [channelId, channel] of channels) {
+      try {
+        let lastMessageId = null;
+        let channelMessageCount = 0;
+        const maxMessagesPerChannel = 500; // Limit to prevent rate limiting
+
+        while (channelMessageCount < maxMessagesPerChannel) {
+          const options = { limit: 100 };
+          if (lastMessageId) options.before = lastMessageId;
+
+          const messages = await channel.messages.fetch(options);
+          if (messages.size === 0) break;
+
+          const userMessages = messages.filter(msg => 
+            msg.author.id === user.id && 
+            msg.createdTimestamp >= member.joinedTimestamp
+          );
+
+          for (const [msgId, message] of userMessages) {
+            const messageDate = new Date(message.createdTimestamp);
+            const dateKey = messageDate.toISOString().split('T')[0];
+            
+            if (behaviorData.dailyActivity.has(dateKey)) {
+              const dayData = behaviorData.dailyActivity.get(dateKey);
+              dayData.messages++;
+              
+              // Count links
+              const linkPattern = /(https?:\/\/[^\s]+)/g;
+              const links = (message.content.match(linkPattern) || []).length;
+              dayData.links += links;
+              behaviorData.messageStats.totalLinks += links;
+
+              // Count mentions
+              const mentions = message.mentions.users.size + message.mentions.roles.size + message.mentions.channels.size;
+              dayData.mentions += mentions;
+              behaviorData.messageStats.totalMentions += mentions;
+
+              behaviorData.messageStats.totalMessages++;
+            }
+          }
+
+          channelMessageCount += messages.size;
+          lastMessageId = messages.last()?.id;
+
+          // Stop if we've gone past the join date
+          const oldestMessage = messages.last();
+          if (oldestMessage && oldestMessage.createdTimestamp < member.joinedTimestamp) {
+            break;
+          }
+        }
+      } catch (error) {
+        console.error(`Error fetching messages from channel ${channel.name}:`, error);
+      }
+    }
+
+    // Process daily activity data
+    const activityArray = Array.from(behaviorData.dailyActivity.values())
+      .sort((a, b) => a.timestamp - b.timestamp);
+
+    behaviorData.activityTimeline = activityArray;
+
+    // Calculate statistics
+    if (daysSinceJoin > 0) {
+      behaviorData.messageStats.averageMessagesPerDay = Math.round(
+        behaviorData.messageStats.totalMessages / daysSinceJoin
+      );
+    }
+
+    // Find peak activity day
+    let peakDay = null;
+    let peakCount = 0;
+    for (const dayData of activityArray) {
+      if (dayData.messages > peakCount) {
+        peakCount = dayData.messages;
+        peakDay = dayData.date;
+      }
+    }
+    behaviorData.messageStats.peakActivityDay = peakDay;
+    behaviorData.messageStats.peakActivityCount = peakCount;
+
+    // Detect suspicious activity spikes
+    const averageDaily = behaviorData.messageStats.averageMessagesPerDay;
+    const spikeThreshold = Math.max(10, averageDaily * 3); // 3x average or minimum 10
+
+    for (let i = 0; i < activityArray.length; i++) {
+      const dayData = activityArray[i];
+      if (dayData.messages >= spikeThreshold) {
+        // Check if it's part of a sustained spike
+        let spikeStart = i;
+        let spikeEnd = i;
+        
+        // Find start of spike
+        while (spikeStart > 0 && activityArray[spikeStart - 1].messages > averageDaily * 1.5) {
+          spikeStart--;
+        }
+        
+        // Find end of spike
+        while (spikeEnd < activityArray.length - 1 && activityArray[spikeEnd + 1].messages > averageDaily * 1.5) {
+          spikeEnd++;
+        }
+
+        const spikeData = {
+          startDate: activityArray[spikeStart].date,
+          endDate: activityArray[spikeEnd].date,
+          peakMessages: dayData.messages,
+          totalMessages: activityArray.slice(spikeStart, spikeEnd + 1)
+            .reduce((sum, day) => sum + day.messages, 0),
+          duration: spikeEnd - spikeStart + 1
+        };
+
+        // Avoid duplicate spikes
+        const existingSpike = behaviorData.suspiciousSpikes.find(spike => 
+          spike.startDate === spikeData.startDate
+        );
+        
+        if (!existingSpike) {
+          behaviorData.suspiciousSpikes.push(spikeData);
+        }
+
+        // Skip ahead to avoid overlapping spikes
+        i = spikeEnd;
+      }
+    }
+
+    // Analyze activity patterns
+    const hourlyActivity = new Map();
+    const weeklyActivity = new Map();
+    
+    // This would require more detailed timestamp analysis
+    // For now, provide basic pattern analysis
+    const nonZeroDays = activityArray.filter(day => day.messages > 0).length;
+    const consistencyScore = Math.round((nonZeroDays / Math.max(1, daysSinceJoin)) * 100);
+    
+    behaviorData.analysis.consistencyScore = consistencyScore;
+    
+    if (consistencyScore > 80) {
+      behaviorData.analysis.activityPattern = 'Highly Consistent';
+    } else if (consistencyScore > 60) {
+      behaviorData.analysis.activityPattern = 'Moderately Consistent';
+    } else if (consistencyScore > 30) {
+      behaviorData.analysis.activityPattern = 'Sporadic';
+    } else {
+      behaviorData.analysis.activityPattern = 'Inactive/Lurker';
+    }
+
+  } catch (error) {
+    console.error('Error analysing behaviour summary:', error);
+    throw error;
+  }
+
+  return behaviorData;
+}
+
+async function createBehaviorSummaryEmbeds(behaviorData, user, guild) {
+  // Generate activity graph data for complete timeline
+  const graphData = generateActivityGraph(behaviorData.activityTimeline);
+
+  // Single comprehensive behavior summary embed
+  const embed = new EmbedBuilder()
+    .setTitle(`Behaviour Analysis: ${user.tag}`)
+    .setDescription(`Complete activity analysis since joining this server`)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true, size: 256 }))
+    .setColor(0x5865F2)
+    .setTimestamp();
+
+  // User info section
+  const joinDate = behaviorData.userInfo.joinedAt ? 
+    `<t:${Math.floor(behaviorData.userInfo.joinedAt / 1000)}:D>` : 'Unknown';
+  const daysSinceJoin = behaviorData.userInfo.joinedAt ? 
+    Math.floor((Date.now() - behaviorData.userInfo.joinedAt) / (1000 * 60 * 60 * 24)) : 0;
+
+  embed.addFields(
+    { name: 'Joined Server', value: joinDate, inline: true },
+    { name: 'Days Since Join', value: `${daysSinceJoin} days`, inline: true },
+    { name: 'Activity Pattern', value: behaviorData.analysis.activityPattern, inline: true }
+  );
+
+  // Message statistics
+  embed.addFields(
+    { name: 'Total Messages', value: behaviorData.messageStats.totalMessages.toString(), inline: true },
+    { name: 'Links Shared', value: behaviorData.messageStats.totalLinks.toString(), inline: true },
+    { name: 'Total Mentions', value: behaviorData.messageStats.totalMentions.toString(), inline: true }
+  );
+
+  // Activity metrics
+  embed.addFields(
+    { name: 'Avg Messages/Day', value: behaviorData.messageStats.averageMessagesPerDay.toString(), inline: true },
+    { name: 'Peak Activity Day', value: `${behaviorData.messageStats.peakActivityCount} messages`, inline: true },
+    { name: 'Consistency Score', value: `${behaviorData.analysis.consistencyScore}%`, inline: true }
+  );
+
+  // Complete activity timeline graph
+  if (graphData.length > 0) {
+    const timelineTitle = daysSinceJoin <= 30 ? 
+      `Activity Timeline (${daysSinceJoin} days)` : 
+      `Activity Timeline (${daysSinceJoin} days - Showing pattern)`;
+    
+    embed.addFields({
+      name: `📈 ${timelineTitle}`,
+      value: `\`\`\`\n${graphData}\n\`\`\``,
+      inline: false
+    });
+  }
+
+  // Suspicious activity spikes (if any)
+  if (behaviorData.suspiciousSpikes.length > 0) {
+    const spikesText = behaviorData.suspiciousSpikes.slice(0, 3).map(spike => {
+      const duration = spike.duration === 1 ? '1 day' : `${spike.duration} days`;
+      return `${spike.startDate} to ${spike.endDate}: ${spike.totalMessages} messages over ${duration}`;
+    }).join('\n');
+
+    embed.addFields({
+      name: `Suspicious Activity Spikes`,
+      value: spikesText,
+      inline: false
+    });
+  }
+
+  return [embed];
+}
+
+function generateActivityGraph(timeline) {
+  if (timeline.length === 0) return 'No activity data available';
+
+  let dataToGraph = timeline;
+  
+  // If timeline is very long, sample it to fit in Discord embed
+  if (timeline.length > 60) {
+    // Sample every nth day to fit approximately 60 points
+    const step = Math.ceil(timeline.length / 60);
+    dataToGraph = timeline.filter((_, index) => index % step === 0);
+  }
+
+  if (dataToGraph.length === 0) return 'No activity data available';
+
+  const maxMessages = Math.max(...dataToGraph.map(day => day.messages));
+  if (maxMessages === 0) return 'No messages found in timeline';
+
+  // Create a simple text-based graph
+  const graphLines = [];
+  const graphHeight = 8; // Number of rows in graph
+
+  // Create graph rows from top to bottom
+  for (let row = graphHeight; row >= 0; row--) {
+    let line = '';
+    const threshold = (row / graphHeight) * maxMessages;
+    
+    for (const day of dataToGraph) {
+      if (day.messages >= threshold && day.messages > 0) {
+        line += '█';
+      } else if (day.messages >= threshold * 0.7 && day.messages > 0) {
+        line += '▓';
+      } else if (day.messages >= threshold * 0.3 && day.messages > 0) {
+        line += '▒';
+      } else if (day.messages > 0) {
+        line += '░';
+      } else {
+        line += ' ';
+      }
+    }
+    
+    // Add y-axis label
+    const label = Math.round(threshold).toString().padStart(3, ' ');
+    graphLines.push(`${label}│${line}`);
+  }
+
+  // Add x-axis
+  const xAxis = '   └' + '─'.repeat(dataToGraph.length);
+  graphLines.push(xAxis);
+
+  // Add date labels for start and end
+  if (dataToGraph.length >= 2) {
+    const firstDate = dataToGraph[0].date.split('-').slice(1).join('/');
+    const lastDate = dataToGraph[dataToGraph.length - 1].date.split('-').slice(1).join('/');
+    const spacing = ' '.repeat(Math.max(0, dataToGraph.length - firstDate.length - lastDate.length));
+    graphLines.push(`    ${firstDate}${spacing}${lastDate}`);
+  }
+
+  // Add summary line
+  const totalDays = timeline.length;
+  const totalMessages = timeline.reduce((sum, day) => sum + day.messages, 0);
+  graphLines.push(`    Total: ${totalMessages} messages over ${totalDays} days`);
+
+  return graphLines.join('\n');
+}
 
 client.login(process.env.TOKEN);
