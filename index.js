@@ -1,6 +1,7 @@
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ChannelType, StringSelectMenuBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ChannelType, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { calculateRisk } = require('./risks');
 const { makeCheckEmbed } = require('./embeds');
+require('dotenv').config();
 
 const client = new Client({
   intents: [
@@ -14,6 +15,8 @@ const client = new Client({
 
 // Storage for server configurations (in production, use a database)
 const serverConfigs = new Map();
+const joinLog = new Map();
+const userFirstMessage = new Map();
 
 // Slash command definitions
 const commands = [
@@ -24,6 +27,32 @@ const commands = [
       option.setName('user')
         .setDescription('The user to check')
         .setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('configure')
+    .setDescription('Configure security settings')
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('quarantine')
+        .setDescription('Configure the quarantine system')),
+
+  new SlashCommandBuilder()
+    .setName('quarantine')
+    .setDescription('Manually quarantine a user')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The user to quarantine')
+        .setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('allow')
+    .setDescription('Allow a quarantined user')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The user to allow')
+        .setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
     .setName('serverinfo')
@@ -110,10 +139,70 @@ function getServerConfig(guildId) {
     serverConfigs.set(guildId, {
       reactionLogsChannel: null,
       deletedLogsChannel: null,
-      editLogsChannel: null
+      editLogsChannel: null,
+      quarantine: {
+        enabled: false,
+        ageThreshold: 0,
+        ageEnabled: false,
+        massJoinEnabled: false,
+        massJoinTime: 5,
+        massJoinCount: 10,
+        profileCheckEnabled: false,
+        linkCheckEnabled: false
+      }
     });
   }
   return serverConfigs.get(guildId);
+}
+
+async function quarantineUser(member, reason) {
+  const guild = member.guild;
+  let quarantineRole = guild.roles.cache.find(r => r.name === 'Quarantined');
+  if (!quarantineRole) {
+    try {
+      quarantineRole = await guild.roles.create({
+        name: 'Quarantined',
+        reason: 'Quarantine system setup'
+      });
+    } catch (e) {
+      console.error('Error creating quarantine role:', e);
+      return;
+    }
+  }
+
+  let quarantineChannel = guild.channels.cache.find(c => c.name === 'quarantine-room');
+  if (!quarantineChannel) {
+    try {
+      quarantineChannel = await guild.channels.create({
+        name: 'quarantine-room',
+        type: ChannelType.GuildText,
+        permissionOverwrites: [
+          {
+            id: guild.id,
+            deny: [PermissionFlagsBits.ViewChannel]
+          },
+          {
+            id: quarantineRole.id,
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
+          },
+          {
+            id: client.user.id,
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
+          }
+        ]
+      });
+    } catch (e) {
+      console.error('Error creating quarantine channel:', e);
+      return;
+    }
+  }
+
+  try {
+    await member.roles.add(quarantineRole);
+    await quarantineChannel.send(`⚠️ ${member} has been quarantined.\n**Reason:** ${reason}\nAn admin or moderator will review your account shortly.`);
+  } catch (e) {
+    console.error('Error adding role or sending message:', e);
+  }
 }
 
 // Helper function to create channel selection menu
@@ -1139,12 +1228,12 @@ async function generateServerRiskReport(guild, requestingUser) {
 
     // Analyze server configuration
     const serverConfigScore = analyzeServerConfiguration(guild);
-    
+
     // Calculate overall server safety score
     const riskPenalty = (report.securityMetrics.highRiskUsers * 15) + 
                        (report.securityMetrics.mediumRiskUsers * 5) +
                        (report.massJoinEvents.length * 10);
-    
+
     const baseScore = Math.max(0, 100 - riskPenalty);
     report.serverSafetyScore = Math.min(100, Math.max(0, baseScore + serverConfigScore));
 
@@ -1274,7 +1363,7 @@ async function createRiskReportEmbed(report, guild) {
     const suspiciousText = report.suspiciousUsers.slice(0, 5).map(user => 
       `**${user.user.tag}** (${user.riskScore}/100) - ${user.riskLevel}`
     ).join('\n');
-    
+
     embed.addFields({
       name: 'Suspicious Users:',
       value: suspiciousText,
@@ -1287,7 +1376,7 @@ async function createRiskReportEmbed(report, guild) {
     const massJoinText = report.massJoinEvents.slice(0, 3).map(event => 
       `**${event.userCount} users** joined during ${event.timeframe.split('_')[0]}`
     ).join('\n');
-    
+
     embed.addFields({
       name: 'Recent Mass Join Events',
       value: massJoinText,
@@ -1391,11 +1480,11 @@ async function analyzeBehaviorSummary(user, guild) {
           for (const [msgId, message] of userMessages) {
             const messageDate = new Date(message.createdTimestamp);
             const dateKey = messageDate.toISOString().split('T')[0];
-            
+
             if (behaviorData.dailyActivity.has(dateKey)) {
               const dayData = behaviorData.dailyActivity.get(dateKey);
               dayData.messages++;
-              
+
               // Count links
               const linkPattern = /(https?:\/\/[^\s]+)/g;
               const links = (message.content.match(linkPattern) || []).length;
@@ -1460,12 +1549,12 @@ async function analyzeBehaviorSummary(user, guild) {
         // Check if it's part of a sustained spike
         let spikeStart = i;
         let spikeEnd = i;
-        
+
         // Find start of spike
         while (spikeStart > 0 && activityArray[spikeStart - 1].messages > averageDaily * 1.5) {
           spikeStart--;
         }
-        
+
         // Find end of spike
         while (spikeEnd < activityArray.length - 1 && activityArray[spikeEnd + 1].messages > averageDaily * 1.5) {
           spikeEnd++;
@@ -1484,7 +1573,7 @@ async function analyzeBehaviorSummary(user, guild) {
         const existingSpike = behaviorData.suspiciousSpikes.find(spike => 
           spike.startDate === spikeData.startDate
         );
-        
+
         if (!existingSpike) {
           behaviorData.suspiciousSpikes.push(spikeData);
         }
@@ -1497,14 +1586,14 @@ async function analyzeBehaviorSummary(user, guild) {
     // Analyze activity patterns
     const hourlyActivity = new Map();
     const weeklyActivity = new Map();
-    
+
     // This would require more detailed timestamp analysis
     // For now, provide basic pattern analysis
     const nonZeroDays = activityArray.filter(day => day.messages > 0).length;
     const consistencyScore = Math.round((nonZeroDays / Math.max(1, daysSinceJoin)) * 100);
-    
+
     behaviorData.analysis.consistencyScore = consistencyScore;
-    
+
     if (consistencyScore > 80) {
       behaviorData.analysis.activityPattern = 'Highly Consistent';
     } else if (consistencyScore > 60) {
@@ -1566,7 +1655,7 @@ async function createBehaviorSummaryEmbeds(behaviorData, user, guild) {
     const timelineTitle = daysSinceJoin <= 30 ? 
       `Activity Timeline (${daysSinceJoin} days)` : 
       `Activity Timeline (${daysSinceJoin} days - Showing pattern)`;
-    
+
     embed.addFields({
       name: `📈 ${timelineTitle}`,
       value: `\`\`\`\n${graphData}\n\`\`\``,
@@ -1595,7 +1684,7 @@ function generateActivityGraph(timeline) {
   if (timeline.length === 0) return 'No activity data available';
 
   let dataToGraph = timeline;
-  
+
   // If timeline is very long, sample it to fit in Discord embed
   if (timeline.length > 60) {
     // Sample every nth day to fit approximately 60 points
@@ -1616,7 +1705,7 @@ function generateActivityGraph(timeline) {
   for (let row = graphHeight; row >= 0; row--) {
     let line = '';
     const threshold = (row / graphHeight) * maxMessages;
-    
+
     for (const day of dataToGraph) {
       if (day.messages >= threshold && day.messages > 0) {
         line += '█';
@@ -1630,7 +1719,7 @@ function generateActivityGraph(timeline) {
         line += ' ';
       }
     }
-    
+
     // Add y-axis label
     const label = Math.round(threshold).toString().padStart(3, ' ');
     graphLines.push(`${label}│${line}`);
