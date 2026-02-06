@@ -121,7 +121,24 @@ const commands = [
       option.setName('user')
         .setDescription('The user to analyze')
         .setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('delete')
+    .setDescription('Moderation commands')
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('messages')
+        .setDescription('Delete all messages from a specific user in this channel')
+        .addUserOption(option => 
+          option.setName('user')
+            .setDescription('The user whose messages should be deleted')
+            .setRequired(false))
+        .addStringOption(option =>
+          option.setName('userid')
+            .setDescription('The user ID whose messages should be deleted')
+            .setRequired(false)))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
 ];
 
 // Helper functions for permissions
@@ -550,6 +567,39 @@ client.on('interactionCreate', async interaction => {
       );
 
       return interaction.editReply({ embeds: [embed], components: [buttons] });
+    }
+
+    if (commandName === 'delete') {
+      const subcommand = interaction.options.getSubcommand();
+      if (subcommand === 'messages') {
+        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+          return interaction.reply({ content: '🚫 You need Manage Messages permissions to use this command.', ephemeral: true });
+        }
+
+        const targetUser = interaction.options.getUser('user');
+        const targetId = interaction.options.getString('userid') || (targetUser ? targetUser.id : null);
+
+        if (!targetId) {
+          return interaction.reply({ content: '❌ Please provide either a user or a user ID.', ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+          const messages = await interaction.channel.messages.fetch({ limit: 100 });
+          const userMessages = messages.filter(m => m.author.id === targetId);
+
+          if (userMessages.size === 0) {
+            return interaction.editReply({ content: 'No recent messages found from that user in this channel.' });
+          }
+
+          await interaction.channel.bulkDelete(userMessages, true);
+          return interaction.editReply({ content: `✅ Deleted ${userMessages.size} messages from the specified user.` });
+        } catch (error) {
+          console.error('Error deleting messages:', error);
+          return interaction.editReply({ content: '❌ Failed to delete messages. They might be older than 14 days or I lack permissions.' });
+        }
+      }
     }
 
     if (commandName === 'serverinfo') {
