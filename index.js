@@ -573,7 +573,7 @@ client.on('interactionCreate', async interaction => {
       const subcommand = interaction.options.getSubcommand();
       if (subcommand === 'messages') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
-          return interaction.reply({ content: '🚫 You need Manage Messages permissions to use this command.', ephemeral: true });
+          return interaction.reply({ content: '🚫 You need Manage Messages permissions to use this command.', ephemeral: false });
         }
 
         const targetUser = interaction.options.getUser('user');
