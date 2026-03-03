@@ -339,6 +339,25 @@ client.once('ready', async () => {
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
+  // Status auto-reply when the bot owner is mentioned
+  const ownerId = '1017058457718034503';
+  if (message.mentions.users.has(ownerId)) {
+    try {
+      const member = message.guild.members.cache.get(ownerId) || await message.guild.members.fetch(ownerId).catch(() => null);
+      const status = member?.presence?.status || 'offline';
+      
+      let statusText = `is currently **${status}**`;
+      if (status === 'dnd') statusText = 'is in **Do Not Disturb** mode';
+      else if (status === 'idle') statusText = 'is currently **away/idle**. Please ping him when he is available!';
+      else if (status === 'online') statusText = 'is **online**, but they might be busy! Please do not ping him';
+      else if (status === 'offline') statusText = 'is **offline** right now, you may have to wait for a while...';
+
+      await message.reply(`Nya! My owner ${statusText}!`).catch(console.error);
+    } catch (err) {
+      console.error('Error in owner mention reply:', err);
+    }
+  }
+
   // Handle !riskreport command
   if (message.content.startsWith('!riskreport')) {
     if (!isModerator(message.member)) {
@@ -586,15 +605,41 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferReply({ ephemeral: true });
 
         try {
-          const messages = await interaction.channel.messages.fetch({ limit: 100 });
-          const userMessages = messages.filter(m => m.author.id === targetId);
+          let totalDeleted = 0;
+          let lastId = null;
+          let searching = true;
 
-          if (userMessages.size === 0) {
-            return interaction.editReply({ content: 'No recent messages found from that user in this channel.' });
+          while (searching && totalDeleted < 500) { // Safety limit of 500 messages
+            const options = { limit: 100 };
+            if (lastId) options.before = lastId;
+
+            const fetchedMessages = await interaction.channel.messages.fetch(options);
+            if (fetchedMessages.size === 0) {
+              searching = false;
+              break;
+            }
+
+            const userMessages = fetchedMessages.filter(m => m.author.id === targetId);
+            
+            if (userMessages.size > 0) {
+              const deleted = await interaction.channel.bulkDelete(userMessages, true);
+              totalDeleted += deleted.size;
+            }
+
+            lastId = fetchedMessages.last().id;
+
+            // Stop if we've reached messages older than 14 days (bulkDelete limit)
+            const oldestMessage = fetchedMessages.last();
+            if (Date.now() - oldestMessage.createdTimestamp > 14 * 24 * 60 * 60 * 1000) {
+              searching = false;
+            }
           }
 
-          await interaction.channel.bulkDelete(userMessages, true);
-          return interaction.editReply({ content: `✅ Deleted ${userMessages.size} messages from the specified user.` });
+          if (totalDeleted === 0) {
+            return interaction.editReply({ content: 'No deletable messages found from that user in this channel (messages must be under 14 days old).' });
+          }
+
+          return interaction.editReply({ content: `✅ Successfully scoured the channel and deleted ${totalDeleted} messages from the specified user.` });
         } catch (error) {
           console.error('Error deleting messages:', error);
           return interaction.editReply({ content: '❌ Failed to delete messages. They might be older than 14 days or I lack permissions.' });
