@@ -340,7 +340,7 @@ client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
   // Status auto-reply when the bot owner is mentioned
-  const ownerId = '1017058457718034503';
+  const ownerId = '1299875574894039184';
   if (message.mentions.users.has(ownerId)) {
     try {
       const member = message.guild.members.cache.get(ownerId) || await message.guild.members.fetch(ownerId).catch(() => null);
@@ -352,7 +352,7 @@ client.on('messageCreate', async message => {
       else if (status === 'online') statusText = 'is **online**, but they might be busy! Please do not ping him';
       else if (status === 'offline') statusText = 'is **offline** right now, you may have to wait for a while...';
 
-      await message.reply(`Nya! My owner ${statusText}!`).catch(console.error);
+      await message.reply(`Nya? My owner ${statusText}!`).catch(console.error);
     } catch (err) {
       console.error('Error in owner mention reply:', err);
     }
