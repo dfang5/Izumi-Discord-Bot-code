@@ -9,7 +9,8 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessageReactions
+    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildPresences
   ]
 });
 
@@ -343,7 +344,12 @@ client.on('messageCreate', async message => {
   const ownerId = '1299875574894039184';
   if (message.mentions.users.has(ownerId)) {
     try {
-      const member = message.guild.members.cache.get(ownerId) || await message.guild.members.fetch(ownerId).catch(() => null);
+      // Ensure we have the member and their presence cached
+      let member = message.guild.members.cache.get(ownerId);
+      if (!member || !member.presence) {
+        member = await message.guild.members.fetch({ user: ownerId, withPresences: true }).catch(() => null);
+      }
+      
       const status = member?.presence?.status || 'offline';
       
       let statusText = `is currently **${status}**`;
