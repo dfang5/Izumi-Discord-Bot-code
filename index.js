@@ -352,11 +352,10 @@ client.on('messageCreate', async message => {
       
       const status = member?.presence?.status || 'offline';
       
+      if (status === 'online' || status === 'idle') return;
+
       let statusText = `is currently **${status}**`;
       if (status === 'dnd') statusText = 'is in **Do Not Disturb** mode';
-      else if (status === 'idle') statusText = 'is currently **idle**. Please wait a moment while I get their attention!';
-      else if (status === 'online') statusText = 'is **online**, but they might be busy! Please wait while I try to get their attention!';
-      else if (status === 'offline') statusText = 'is **offline** right now, you may have to wait for a while...';
 
       await message.reply(`Nya? My master ${statusText}!`).catch(console.error);
     } catch (err) {
