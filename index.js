@@ -349,9 +349,9 @@ client.on('messageCreate', async message => {
       if (!member || !member.presence) {
         member = await message.guild.members.fetch({ user: ownerId, withPresences: true }).catch(() => null);
       }
-      
+
       const status = member?.presence?.status || 'offline';
-      
+
       if (status === 'online' || status === 'idle') return;
 
       let statusText = `is currently **${status}**`;
@@ -625,7 +625,7 @@ client.on('interactionCreate', async interaction => {
             }
 
             const userMessages = fetchedMessages.filter(m => m.author.id === targetId);
-            
+
             if (userMessages.size > 0) {
               const deleted = await interaction.channel.bulkDelete(userMessages, true);
               totalDeleted += deleted.size;
@@ -870,6 +870,103 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply({ content: '❌ Error generating behavior summary. Please try again.' });
       }
     }
+
+    if (commandName === 'quarantine') {
+      if (!isAdmin(interaction.member)) {
+        return interaction.reply({ content: '🚫 You need administrator permissions to quarantine users.', ephemeral: true });
+      }
+
+      const target = interaction.options.getUser('user');
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+
+      if (!member) {
+        return interaction.reply({ content: '❌ That user is not in this server.', ephemeral: true });
+      }
+
+      if (isAdmin(member)) {
+        return interaction.reply({ content: '🛡️ You cannot quarantine an administrator.', ephemeral: true });
+      }
+
+      const quarantineRole = interaction.guild.roles.cache.find(r => r.name === 'Quarantined');
+      if (quarantineRole && member.roles.cache.has(quarantineRole.id)) {
+        return interaction.reply({ content: `⚠️ **${target.tag}** is already quarantined.`, ephemeral: true });
+      }
+
+      await interaction.deferReply();
+      await quarantineUser(member, `Manually quarantined by ${interaction.user.tag}`);
+      return interaction.editReply({ content: `🔒 **${target.tag}** has been moved to quarantine.` });
+    }
+
+    if (commandName === 'allow') {
+      if (!isAdmin(interaction.member)) {
+        return interaction.reply({ content: '🚫 You need administrator permissions to release users from quarantine.', ephemeral: true });
+      }
+
+      const target = interaction.options.getUser('user');
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+
+      if (!member) {
+        return interaction.reply({ content: '❌ That user is not in this server.', ephemeral: true });
+      }
+
+      const quarantineRole = interaction.guild.roles.cache.find(r => r.name === 'Quarantined');
+      if (!quarantineRole || !member.roles.cache.has(quarantineRole.id)) {
+        return interaction.reply({ content: '⚠️ That user is not currently quarantined.', ephemeral: true });
+      }
+
+      await interaction.deferReply();
+      try {
+        await member.roles.remove(quarantineRole);
+        const quarantineChannel = interaction.guild.channels.cache.find(c => c.name === 'quarantine-room');
+        if (quarantineChannel) {
+          await quarantineChannel.send(`✅ ${member} has been cleared from quarantine by a moderator and can now access the server.`).catch(() => {});
+        }
+        return interaction.editReply({ content: `✅ **${target.tag}** has been released from quarantine.` });
+      } catch (e) {
+        console.error('Error removing quarantine role:', e);
+        return interaction.editReply({ content: '❌ Failed to remove quarantine role. Check my permissions.' });
+      }
+    }
+
+    if (commandName === 'configure') {
+      const subcommand = interaction.options.getSubcommand();
+      if (subcommand === 'quarantine') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: '🚫 You need administrator permissions to configure quarantine.', ephemeral: true });
+        }
+
+        const config = getServerConfig(interaction.guild.id);
+        const qConfig = config.quarantine;
+
+        const embed = new EmbedBuilder()
+          .setTitle('🔒 Quarantine Configuration')
+          .setDescription('Toggle settings using the buttons below. Changes take effect immediately.')
+          .addFields(
+            { name: 'Quarantine System', value: qConfig.enabled ? '✅ Enabled' : '❌ Disabled', inline: true },
+            { name: 'Account Age Check', value: qConfig.ageEnabled ? `✅ Enabled (< ${qConfig.ageThreshold} days)` : '❌ Disabled', inline: true },
+            { name: 'Mass Join Detection', value: qConfig.massJoinEnabled ? `✅ Enabled (${qConfig.massJoinCount} joins / ${qConfig.massJoinTime}min)` : '❌ Disabled', inline: true }
+          )
+          .setColor(0x5865F2)
+          .setTimestamp();
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`qconfig_toggle_${interaction.guild.id}`)
+            .setLabel(qConfig.enabled ? 'Disable Quarantine' : 'Enable Quarantine')
+            .setStyle(qConfig.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(`qconfig_age_${interaction.guild.id}`)
+            .setLabel(qConfig.ageEnabled ? 'Disable Age Check' : 'Enable Age Check')
+            .setStyle(qConfig.ageEnabled ? ButtonStyle.Danger : ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(`qconfig_massjoin_${interaction.guild.id}`)
+            .setLabel(qConfig.massJoinEnabled ? 'Disable Mass Join' : 'Enable Mass Join')
+            .setStyle(qConfig.massJoinEnabled ? ButtonStyle.Danger : ButtonStyle.Success)
+        );
+
+        return interaction.reply({ embeds: [embed], components: [row] });
+      }
+    }
   }
 
   // ✅ Select menu interaction handler
@@ -925,6 +1022,59 @@ client.on('interactionCreate', async interaction => {
 
   // ✅ Button interaction handler
   if (!interaction.isButton()) return;
+
+  // Handle quarantine config toggle buttons
+  if (interaction.customId.startsWith('qconfig_')) {
+    if (!isAdmin(interaction.member)) {
+      return interaction.reply({ content: '🚫 You need administrator permissions.', ephemeral: true });
+    }
+
+    const parts = interaction.customId.split('_');
+    const setting = parts[1];
+    const guildId = parts.slice(2).join('_');
+
+    const config = getServerConfig(guildId);
+    const qConfig = config.quarantine;
+
+    if (setting === 'toggle') {
+      qConfig.enabled = !qConfig.enabled;
+    } else if (setting === 'age') {
+      qConfig.ageEnabled = !qConfig.ageEnabled;
+      if (qConfig.ageEnabled && qConfig.ageThreshold === 0) qConfig.ageThreshold = 7;
+    } else if (setting === 'massjoin') {
+      qConfig.massJoinEnabled = !qConfig.massJoinEnabled;
+    }
+
+    serverConfigs.set(guildId, config);
+
+    const embed = new EmbedBuilder()
+      .setTitle('🔒 Quarantine Configuration')
+      .setDescription('Toggle settings using the buttons below. Changes take effect immediately.')
+      .addFields(
+        { name: 'Quarantine System', value: qConfig.enabled ? '✅ Enabled' : '❌ Disabled', inline: true },
+        { name: 'Account Age Check', value: qConfig.ageEnabled ? `✅ Enabled (< ${qConfig.ageThreshold} days)` : '❌ Disabled', inline: true },
+        { name: 'Mass Join Detection', value: qConfig.massJoinEnabled ? `✅ Enabled (${qConfig.massJoinCount} joins / ${qConfig.massJoinTime}min)` : '❌ Disabled', inline: true }
+      )
+      .setColor(0x5865F2)
+      .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`qconfig_toggle_${guildId}`)
+        .setLabel(qConfig.enabled ? 'Disable Quarantine' : 'Enable Quarantine')
+        .setStyle(qConfig.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`qconfig_age_${guildId}`)
+        .setLabel(qConfig.ageEnabled ? 'Disable Age Check' : 'Enable Age Check')
+        .setStyle(qConfig.ageEnabled ? ButtonStyle.Danger : ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`qconfig_massjoin_${guildId}`)
+        .setLabel(qConfig.massJoinEnabled ? 'Disable Mass Join' : 'Enable Mass Join')
+        .setStyle(qConfig.massJoinEnabled ? ButtonStyle.Danger : ButtonStyle.Success)
+    );
+
+    return interaction.update({ embeds: [embed], components: [row] });
+  }
 
   const [action, userId] = interaction.customId.split('_');
   const targetUser = await interaction.client.users.fetch(userId).catch(() => null);
@@ -1225,6 +1375,48 @@ client.on('messageReactionRemove', async (reaction, user) => {
     await logChannel.send({ embeds: [embed] });
   } catch (error) {
     console.error('Error sending reaction removal log:', error);
+  }
+});
+
+// ✅ Auto-quarantine on member join
+client.on('guildMemberAdd', async member => {
+  const config = getServerConfig(member.guild.id);
+  if (!config.quarantine.enabled) return;
+
+  const user = member.user;
+  const guildId = member.guild.id;
+  const qConfig = config.quarantine;
+
+  // Track join times for mass join detection
+  if (!joinLog.has(guildId)) joinLog.set(guildId, []);
+  const guildJoins = joinLog.get(guildId);
+  guildJoins.push(Date.now());
+
+  // Clean up joins outside the detection window
+  const windowMs = qConfig.massJoinTime * 60 * 1000;
+  const recentJoins = guildJoins.filter(t => Date.now() - t < windowMs);
+  joinLog.set(guildId, recentJoins);
+
+  let shouldQuarantine = false;
+  let reason = '';
+
+  // Account age check
+  if (qConfig.ageEnabled && qConfig.ageThreshold > 0) {
+    const accountAgeDays = (Date.now() - user.createdTimestamp) / (1000 * 60 * 60 * 24);
+    if (accountAgeDays < qConfig.ageThreshold) {
+      shouldQuarantine = true;
+      reason = `New account: ${Math.floor(accountAgeDays)} days old (threshold: ${qConfig.ageThreshold} days)`;
+    }
+  }
+
+  // Mass join check
+  if (qConfig.massJoinEnabled && recentJoins.length >= qConfig.massJoinCount) {
+    shouldQuarantine = true;
+    reason = `Mass join detected: ${recentJoins.length} users joined in the last ${qConfig.massJoinTime} minutes`;
+  }
+
+  if (shouldQuarantine) {
+    await quarantineUser(member, reason);
   }
 });
 
