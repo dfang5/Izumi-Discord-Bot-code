@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ChannelType, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ChannelType, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, RoleSelectMenuBuilder, UserSelectMenuBuilder, ChannelSelectMenuBuilder } = require('discord.js');
 const { calculateRisk } = require('./risks');
 const { makeCheckEmbed } = require('./embeds');
 require('dotenv').config();
@@ -18,6 +18,7 @@ const client = new Client({
 const serverConfigs = new Map();
 const joinLog = new Map();
 const userFirstMessage = new Map();
+const advancedConfig = new Map(); // guildId -> Map<channelId, ChannelConfig>
 
 // Slash command definitions
 const commands = [
@@ -139,7 +140,16 @@ const commands = [
           option.setName('userid')
             .setDescription('The user ID whose messages should be deleted')
             .setRequired(false)))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+
+  new SlashCommandBuilder()
+    .setName('advanced')
+    .setDescription('Advanced content restriction controls')
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('toggle')
+        .setDescription('Configure per-channel content restrictions, role jurisdiction, and user exemptions'))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ];
 
 // Helper functions for permissions
@@ -172,6 +182,183 @@ function getServerConfig(guildId) {
   }
   return serverConfigs.get(guildId);
 }
+
+// ---- Advanced config helpers ----
+
+function getAdvancedGuildConfig(guildId) {
+  if (!advancedConfig.has(guildId)) advancedConfig.set(guildId, new Map());
+  return advancedConfig.get(guildId);
+}
+
+function getAdvancedChannelConfig(guildId, channelId) {
+  const guildCfg = getAdvancedGuildConfig(guildId);
+  if (!guildCfg.has(channelId)) {
+    guildCfg.set(channelId, {
+      mode: null,
+      restrictedRoles: [],
+      restrictedUsers: [],
+      exemptRoles: [],
+      exemptUsers: []
+    });
+  }
+  return guildCfg.get(channelId);
+}
+
+function isSubjectToAdvancedRestriction(member, cfg) {
+  if (cfg.exemptUsers.includes(member.id)) return false;
+  if (cfg.exemptRoles.some(roleId => member.roles.cache.has(roleId))) return false;
+  if (cfg.restrictedRoles.length > 0 || cfg.restrictedUsers.length > 0) {
+    return cfg.restrictedRoles.some(roleId => member.roles.cache.has(roleId)) ||
+           cfg.restrictedUsers.includes(member.id);
+  }
+  return true;
+}
+
+async function checkAdvancedRestrictions(message) {
+  const guildCfg = advancedConfig.get(message.guild.id);
+  if (!guildCfg) return false;
+
+  const channelCfg = guildCfg.get(message.channel.id);
+  if (!channelCfg || !channelCfg.mode) return false;
+
+  const member = message.member;
+  if (!member || isAdmin(member)) return false;
+  if (!isSubjectToAdvancedRestriction(member, channelCfg)) return false;
+
+  if (channelCfg.mode === 'messages_only') {
+    const hasMedia = message.attachments.some(a =>
+      a.contentType?.startsWith('image/') || a.contentType?.startsWith('video/')
+    ) || message.embeds.some(e => e.image || e.video || e.thumbnail);
+
+    if (hasMedia) {
+      const savedText = message.content?.trim() || '';
+      await message.delete().catch(() => {});
+      const response = await message.channel.send({
+        content: `${member}, this channel is set to **text only**. Your message was removed because it contained media.\n\n` +
+          (savedText
+            ? `Your text has been saved. Copy and resend it:\n\`\`\`\n${savedText.substring(0, 1800)}\n\`\`\``
+            : 'Your message contained no text content.')
+      });
+      setTimeout(() => response.delete().catch(() => {}), 60000);
+      return true;
+    }
+  }
+
+  if (channelCfg.mode === 'media_only') {
+    const hasText = message.content && message.content.trim().length > 0;
+    if (hasText) {
+      const mediaUrls = message.attachments
+        .filter(a => a.contentType?.startsWith('image/') || a.contentType?.startsWith('video/'))
+        .map(a => a.url)
+        .join('\n');
+      await message.delete().catch(() => {});
+      const response = await message.channel.send({
+        content: `${member}, this channel is set to **media only**. Your message was removed because it contained text.\n\n` +
+          (mediaUrls
+            ? `Your media has been saved. Use the link(s) below to repost:\n${mediaUrls}`
+            : 'Your message contained no media.')
+      });
+      setTimeout(() => response.delete().catch(() => {}), 60000);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildAdvancedPanel(guild, channelId) {
+  const guildCfg = getAdvancedGuildConfig(guild.id);
+  const channel = guild.channels.cache.get(channelId);
+  const cfg = guildCfg.has(channelId) ? guildCfg.get(channelId) : { mode: null, restrictedRoles: [], exemptRoles: [], exemptUsers: [] };
+
+  const modeLabel = cfg.mode === 'messages_only' ? 'Messages Only'
+    : cfg.mode === 'media_only' ? 'Media Only'
+    : 'Unrestricted';
+
+  const modeColor = cfg.mode === 'messages_only' ? 0x5865F2
+    : cfg.mode === 'media_only' ? 0x9B59B6
+    : 0x36393F;
+
+  const restrictedText = cfg.restrictedRoles.length > 0
+    ? cfg.restrictedRoles.map(id => `<@&${id}>`).join(', ')
+    : 'All members';
+
+  const exemptRolesText = cfg.exemptRoles.length > 0
+    ? cfg.exemptRoles.map(id => `<@&${id}>`).join(', ')
+    : 'None';
+
+  const exemptUsersText = cfg.exemptUsers.length > 0
+    ? cfg.exemptUsers.map(id => `<@${id}>`).join(', ')
+    : 'None';
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Advanced Security | #${channel?.name || channelId}`)
+    .setDescription('Configure content restrictions for this channel. Mode changes apply immediately.')
+    .addFields(
+      { name: 'Current Mode', value: `**${modeLabel}**`, inline: true },
+      { name: 'Restricted To', value: restrictedText, inline: true },
+      { name: '\u200b', value: '\u200b', inline: true },
+      { name: 'Exempt Roles', value: exemptRolesText, inline: true },
+      { name: 'Exempt Users', value: exemptUsersText, inline: true },
+      { name: '\u200b', value: '\u200b', inline: true }
+    )
+    .setColor(modeColor)
+    .setFooter({ text: 'Administrators are always exempt. Use the selects below to manage roles and users.' })
+    .setTimestamp();
+
+  const channelSelect = new ChannelSelectMenuBuilder()
+    .setCustomId(`adv_chan_${guild.id}`)
+    .setPlaceholder(`Viewing: #${channel?.name || channelId} — select another to switch`)
+    .setChannelTypes([ChannelType.GuildText])
+    .setMinValues(1)
+    .setMaxValues(1);
+
+  const modeRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`adv_mode_messages_${channelId}`)
+      .setLabel('Messages Only')
+      .setStyle(cfg.mode === 'messages_only' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`adv_mode_media_${channelId}`)
+      .setLabel('Media Only')
+      .setStyle(cfg.mode === 'media_only' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`adv_mode_off_${channelId}`)
+      .setLabel('Unrestricted')
+      .setStyle(!cfg.mode ? ButtonStyle.Success : ButtonStyle.Secondary)
+  );
+
+  const restrictRolesSelect = new RoleSelectMenuBuilder()
+    .setCustomId(`adv_roles_restrict_${channelId}`)
+    .setPlaceholder('Restrict to these roles — leave empty to apply to all members')
+    .setMinValues(0)
+    .setMaxValues(25);
+
+  const exemptRolesSelect = new RoleSelectMenuBuilder()
+    .setCustomId(`adv_roles_exempt_${channelId}`)
+    .setPlaceholder('Exempt these roles from restrictions')
+    .setMinValues(0)
+    .setMaxValues(25);
+
+  const exemptUsersSelect = new UserSelectMenuBuilder()
+    .setCustomId(`adv_users_exempt_${channelId}`)
+    .setPlaceholder('Exempt these users from restrictions')
+    .setMinValues(0)
+    .setMaxValues(25);
+
+  return {
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder().addComponents(channelSelect),
+      modeRow,
+      new ActionRowBuilder().addComponents(restrictRolesSelect),
+      new ActionRowBuilder().addComponents(exemptRolesSelect),
+      new ActionRowBuilder().addComponents(exemptUsersSelect)
+    ]
+  };
+}
+
+// ---- End advanced config helpers ----
 
 async function quarantineUser(member, reason) {
   const guild = member.guild;
@@ -217,7 +404,7 @@ async function quarantineUser(member, reason) {
 
   try {
     await member.roles.add(quarantineRole);
-    await quarantineChannel.send(`⚠️ ${member} has been quarantined.\n**Reason:** ${reason}\nAn admin or moderator will review your account shortly.`);
+    await quarantineChannel.send(` ${member} has been quarantined.\n**Reason:** ${reason}\nAn admin or moderator will review your account shortly.`);
   } catch (e) {
     console.error('Error adding role or sending message:', e);
   }
@@ -288,11 +475,11 @@ async function analyzeMutualConnections(targetUser, requestingUser, client) {
 
         // Detect suspicious patterns
         if (joinDiffHours < 24) {
-          suspiciousPatterns.push(`⚠️ Joined ${guild.name} within 24 hours of each other`);
+          suspiciousPatterns.push(` Joined ${guild.name} within 24 hours of each other`);
         }
 
         if (joinDiffHours < 1) {
-          suspiciousPatterns.push(`🚨 Joined ${guild.name} within 1 hour of each other`);
+          suspiciousPatterns.push(` Joined ${guild.name} within 1 hour of each other`);
         }
 
       } catch (error) {
@@ -311,34 +498,40 @@ async function analyzeMutualConnections(targetUser, requestingUser, client) {
     return {
       mutualCount: 0,
       connections: [],
-      suspiciousPatterns: ['❓ Unable to analyze mutual connections'],
+      suspiciousPatterns: [' Unable to analyze mutual connections'],
       hasCloseTimingPattern: false
     };
   }
 }
 
-// ✅ Bot login and slash command registration
+//  Bot login and slash command registration
 client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
+  console.log(` Logged in as ${client.user.tag}`);
 
   // Register slash commands
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
 
   try {
-    console.log('🔄 Registering slash commands...');
+    console.log(' Registering slash commands...');
     await rest.put(
       Routes.applicationCommands(client.user.id),
       { body: commands }
     );
-    console.log('✅ Slash commands registered successfully!');
+    console.log(' Slash commands registered successfully!');
   } catch (error) {
-    console.error('❌ Error registering slash commands:', error);
+    console.error(' Error registering slash commands:', error);
   }
 });
 
-// ✅ Message command handler with loading reactions
+//  Message command handler with loading reactions
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
+
+  // Advanced content restriction enforcement
+  if (message.guild) {
+    const handled = await checkAdvancedRestrictions(message);
+    if (handled) return;
+  }
 
   // Status auto-reply when the bot owner is mentioned
   const ownerId = '1299875574894039184';
@@ -369,29 +562,13 @@ client.on('messageCreate', async message => {
       return message.reply('You need moderator permissions to use this command.');
     }
 
-    // Add loading reactions
-    const loadingEmojis = ['🔍', '📊', '🛡️', '⚡', '📋'];
-    for (const emoji of loadingEmojis) {
-      await message.react(emoji).catch(() => {});
-    }
-
     try {
       const report = await generateServerRiskReport(message.guild, message.author);
       const embed = await createRiskReportEmbed(report, message.guild);
-
-      // Remove loading reactions
-      for (const emoji of loadingEmojis) {
-        await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
-      }
-
       return message.reply({ embeds: [embed] });
     } catch (error) {
       console.error('Error generating risk report:', error);
-      // Remove loading reactions
-      for (const emoji of loadingEmojis) {
-        await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
-      }
-      return message.reply('❌ Error generating server risk report. Please try again.');
+      return message.reply('Error generating server risk report. Please try again.');
     }
   }
 
@@ -410,7 +587,7 @@ client.on('messageCreate', async message => {
       try {
         target = await client.users.fetch(args[0]);
       } catch {
-        return message.reply('❌ Could not find a user with that ID.');
+        return message.reply('Could not find a user with that ID.');
       }
     }
 
@@ -418,29 +595,13 @@ client.on('messageCreate', async message => {
       return message.reply('Please mention a user or provide a valid user ID.');
     }
 
-    // Add loading reactions
-    const loadingEmojis = ['📊', '📈', '🔍', '📋', '⏳'];
-    for (const emoji of loadingEmojis) {
-      await message.react(emoji).catch(() => {});
-    }
-
     try {
       const behaviorData = await analyzeBehaviorSummary(target, message.guild);
       const embeds = await createBehaviorSummaryEmbeds(behaviorData, target, message.guild);
-
-      // Remove loading reactions
-      for (const emoji of loadingEmojis) {
-        await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
-      }
-
       return message.reply({ embeds });
     } catch (error) {
       console.error('Error generating behavior summary:', error);
-      // Remove loading reactions
-      for (const emoji of loadingEmojis) {
-        await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
-      }
-      return message.reply('❌ Error generating behavior summary. Please try again.');
+      return message.reply('Error generating behavior summary. Please try again.');
     }
   }
 
@@ -448,12 +609,6 @@ client.on('messageCreate', async message => {
 
   if (!isModerator(message.member)) {
     return message.reply('You need moderator permissions to use this command.');
-  }
-
-  // Add loading reactions
-  const loadingEmojis = ['🇱', '🇴', '🇦', '🇩', '🇮', '🇳', '🇬'];
-  for (const emoji of loadingEmojis) {
-    await message.react(emoji).catch(() => {});
   }
 
   const args = message.content.split(' ').slice(1);
@@ -465,19 +620,11 @@ client.on('messageCreate', async message => {
     try {
       target = await client.users.fetch(args[0]);
     } catch {
-      // Remove loading reactions
-      for (const emoji of loadingEmojis) {
-        await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
-      }
-      return message.reply('❌ Could not find a user with that ID.');
+      return message.reply('Could not find a user with that ID.');
     }
   }
 
   if (!target) {
-    // Remove loading reactions
-    for (const emoji of loadingEmojis) {
-      await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
-    }
     return message.reply('Please mention a user or provide a valid user ID.');
   }
 
@@ -512,28 +659,23 @@ client.on('messageCreate', async message => {
   const isTargetAdmin = targetMember && isAdmin(targetMember);
 
   const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`allow_${target.id}`).setLabel('✅ Allow').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`allow_${target.id}`).setLabel('Allow').setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`kick_${target.id}`)
-      .setLabel(isTargetAdmin ? '❌ Kick (Admin Immune)' : '❌ Kick')
+      .setLabel(isTargetAdmin ? 'Kick (Admin Immune)' : 'Kick')
       .setStyle(ButtonStyle.Danger)
       .setDisabled(isTargetAdmin),
     new ButtonBuilder()
       .setCustomId(`ban_${target.id}`)
-      .setLabel(isTargetAdmin ? '🔨 Ban (Admin Immune)' : '🔨 Ban')
+      .setLabel(isTargetAdmin ? 'Ban (Admin Immune)' : 'Ban')
       .setStyle(ButtonStyle.Danger)
       .setDisabled(isTargetAdmin)
   );
 
-  // Remove loading reactions
-  for (const emoji of loadingEmojis) {
-    await message.reactions.cache.get(emoji)?.users.remove(client.user).catch(() => {});
-  }
-
   return message.reply({ embeds: [embed], components: [buttons] });
 });
 
-// ✅ Slash command handler
+//  Slash command handler
 client.on('interactionCreate', async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
@@ -541,7 +683,7 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'check') {
       if (!isModerator(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need moderator permissions to use this command.', ephemeral: false });
+        return interaction.reply({ content: 'You need moderator permissions to use this command.', ephemeral: false });
       }
 
       await interaction.deferReply();
@@ -556,11 +698,11 @@ client.on('interactionCreate', async interaction => {
       // Apply mutual server risk scoring
       if (mutualAnalysis.hasCloseTimingPattern) {
         risk.score += 25;
-        risk.factors.push('🚨 Suspicious mutual server timing patterns');
+        risk.factors.push(' Suspicious mutual server timing patterns');
       }
       if (mutualAnalysis.mutualCount === 0) {
         risk.score += 5;
-        risk.factors.push('🌐 No detectable mutual servers');
+        risk.factors.push(' No detectable mutual servers');
       }
 
       // Recalculate risk label after mutual analysis
@@ -577,15 +719,15 @@ client.on('interactionCreate', async interaction => {
       const isTargetAdmin = targetMember && isAdmin(targetMember);
 
       const buttons = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`allow_${target.id}`).setLabel('✅ Allow').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`allow_${target.id}`).setLabel('Allow').setStyle(ButtonStyle.Success),
         new ButtonBuilder()
           .setCustomId(`kick_${target.id}`)
-          .setLabel(isTargetAdmin ? '❌ Kick (Admin Immune)' : '❌ Kick')
+          .setLabel(isTargetAdmin ? 'Kick (Admin Immune)' : 'Kick')
           .setStyle(ButtonStyle.Danger)
           .setDisabled(isTargetAdmin),
         new ButtonBuilder()
           .setCustomId(`ban_${target.id}`)
-          .setLabel(isTargetAdmin ? '🔨 Ban (Admin Immune)' : '🔨 Ban')
+          .setLabel(isTargetAdmin ? 'Ban (Admin Immune)' : 'Ban')
           .setStyle(ButtonStyle.Danger)
           .setDisabled(isTargetAdmin)
       );
@@ -597,14 +739,14 @@ client.on('interactionCreate', async interaction => {
       const subcommand = interaction.options.getSubcommand();
       if (subcommand === 'messages') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
-          return interaction.reply({ content: '🚫 You need Manage Messages permissions to use this command.', ephemeral: false });
+          return interaction.reply({ content: 'You need Manage Messages permissions to use this command.', ephemeral: false });
         }
 
         const targetUser = interaction.options.getUser('user');
         const targetId = interaction.options.getString('userid') || (targetUser ? targetUser.id : null);
 
         if (!targetId) {
-          return interaction.reply({ content: '❌ Please provide either a user or a user ID.', ephemeral: true });
+          return interaction.reply({ content: 'Please provide either a user or a user ID.', ephemeral: true });
         }
 
         await interaction.deferReply({ ephemeral: true });
@@ -644,10 +786,10 @@ client.on('interactionCreate', async interaction => {
             return interaction.editReply({ content: 'No deletable messages found from that user in this channel (messages must be under 14 days old).' });
           }
 
-          return interaction.editReply({ content: `✅ Successfully scoured the channel and deleted ${totalDeleted} messages from the specified user.` });
+          return interaction.editReply({ content: `Successfully scoured the channel and deleted ${totalDeleted} messages from the specified user.` });
         } catch (error) {
           console.error('Error deleting messages:', error);
-          return interaction.editReply({ content: '❌ Failed to delete messages. They might be older than 14 days or I lack permissions.' });
+          return interaction.editReply({ content: 'Failed to delete messages. They might be older than 14 days or I lack permissions.' });
         }
       }
     }
@@ -657,15 +799,15 @@ client.on('interactionCreate', async interaction => {
       const owner = await guild.fetchOwner();
 
       const embed = new EmbedBuilder()
-        .setTitle(`📊 Server Information: ${guild.name}`)
+        .setTitle(` Server Information: ${guild.name}`)
         .setThumbnail(guild.iconURL({ dynamic: true }))
         .addFields(
-          { name: '👑 Owner', value: owner.user.tag, inline: true },
-          { name: '👥 Members', value: guild.memberCount.toString(), inline: true },
-          { name: '📅 Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`, inline: true },
-          { name: '🛡️ Verification Level', value: guild.verificationLevel.toString(), inline: true },
-          { name: '📝 Channels', value: guild.channels.cache.size.toString(), inline: true },
-          { name: '😀 Emojis', value: guild.emojis.cache.size.toString(), inline: true }
+          { name: ' Owner', value: owner.user.tag, inline: true },
+          { name: ' Members', value: guild.memberCount.toString(), inline: true },
+          { name: ' Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`, inline: true },
+          { name: ' Verification Level', value: guild.verificationLevel.toString(), inline: true },
+          { name: ' Channels', value: guild.channels.cache.size.toString(), inline: true },
+          { name: ' Emojis', value: guild.emojis.cache.size.toString(), inline: true }
         )
         .setColor(0x5865F2)
         .setTimestamp();
@@ -678,24 +820,24 @@ client.on('interactionCreate', async interaction => {
       const member = await interaction.guild.members.fetch(target.id).catch(() => null);
 
       const embed = new EmbedBuilder()
-        .setTitle(`👤 User Information: ${target.tag}`)
+        .setTitle(` User Information: ${target.tag}`)
         .setThumbnail(target.displayAvatarURL({ dynamic: true }))
         .addFields(
-          { name: '🆔 ID', value: target.id, inline: true },
-          { name: '📅 Account Created', value: `<t:${Math.floor(target.createdTimestamp / 1000)}:D>`, inline: true },
-          { name: '🤖 Bot', value: target.bot ? 'Yes' : 'No', inline: true }
+          { name: ' ID', value: target.id, inline: true },
+          { name: ' Account Created', value: `<t:${Math.floor(target.createdTimestamp / 1000)}:D>`, inline: true },
+          { name: ' Bot', value: target.bot ? 'Yes' : 'No', inline: true }
         )
         .setColor(target.accentColor || 0x5865F2)
         .setTimestamp();
 
       if (member) {
         embed.addFields(
-          { name: '📅 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>`, inline: true },
-          { name: '🎭 Roles', value: member.roles.cache.filter(r => r.id !== interaction.guild.id).map(r => r.name).join(', ') || 'None', inline: false }
+          { name: ' Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>`, inline: true },
+          { name: ' Roles', value: member.roles.cache.filter(r => r.id !== interaction.guild.id).map(r => r.name).join(', ') || 'None', inline: false }
         );
 
         if (member.premiumSince) {
-          embed.addFields({ name: '💎 Boosting Since', value: `<t:${Math.floor(member.premiumSinceTimestamp / 1000)}:D>`, inline: true });
+          embed.addFields({ name: ' Boosting Since', value: `<t:${Math.floor(member.premiumSinceTimestamp / 1000)}:D>`, inline: true });
         }
       }
 
@@ -704,19 +846,19 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'althistory') {
       if (!isModerator(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need moderator permissions to use this command.', ephemeral: false });
+        return interaction.reply({ content: 'You need moderator permissions to use this command.', ephemeral: false });
       }
 
       const limit = interaction.options.getInteger('limit') || 5;
 
       // This is a placeholder - in a real implementation you'd store check history in a database
       const embed = new EmbedBuilder()
-        .setTitle('📜 Recent Alt Account Checks')
+        .setTitle(' Recent Alt Account Checks')
         .setDescription('This feature requires a database to store check history. Currently showing placeholder data.')
         .addFields(
           { name: '⏰ Last 24 Hours', value: 'No checks recorded', inline: false },
-          { name: '📊 Total Checks', value: 'Database not configured', inline: true },
-          { name: '🎯 High Risk Found', value: 'Database not configured', inline: true }
+          { name: ' Total Checks', value: 'Database not configured', inline: true },
+          { name: ' High Risk Found', value: 'Database not configured', inline: true }
         )
         .setColor(0xFFA500)
         .setTimestamp();
@@ -726,14 +868,14 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'setreactionlogs') {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need administrator permissions to configure logging.', ephemeral: false });
+        return interaction.reply({ content: 'You need administrator permissions to configure logging.', ephemeral: false });
       }
 
       const selectMenu = createChannelSelectMenu(interaction.guild.id, 'reaction');
       const row = new ActionRowBuilder().addComponents(selectMenu);
 
       const embed = new EmbedBuilder()
-        .setTitle('🎭 Configure Reaction Logs')
+        .setTitle(' Configure Reaction Logs')
         .setDescription('Select a channel where reaction logs will be posted.')
         .setColor(0x5865F2);
 
@@ -742,14 +884,14 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'setdeletedlogs') {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need administrator permissions to configure logging.', ephemeral: false });
+        return interaction.reply({ content: 'You need administrator permissions to configure logging.', ephemeral: false });
       }
 
       const selectMenu = createChannelSelectMenu(interaction.guild.id, 'deleted');
       const row = new ActionRowBuilder().addComponents(selectMenu);
 
       const embed = new EmbedBuilder()
-        .setTitle('🗑️ Configure Deleted Message Logs')
+        .setTitle(' Configure Deleted Message Logs')
         .setDescription('Select a channel where deleted message logs will be posted.')
         .setColor(0xFF0000);
 
@@ -758,14 +900,14 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'seteditlogs') {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need administrator permissions to configure logging.', ephemeral: false });
+        return interaction.reply({ content: 'You need administrator permissions to configure logging.', ephemeral: false });
       }
 
       const selectMenu = createChannelSelectMenu(interaction.guild.id, 'edit');
       const row = new ActionRowBuilder().addComponents(selectMenu);
 
       const embed = new EmbedBuilder()
-        .setTitle('✏️ Configure Message Edit Logs')
+        .setTitle(' Configure Message Edit Logs')
         .setDescription('Select a channel where message edit logs will be posted.')
         .setColor(0xFFA500);
 
@@ -774,25 +916,25 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'logstatus') {
       if (!isModerator(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need moderator permissions to view logging status.', ephemeral: false });
+        return interaction.reply({ content: 'You need moderator permissions to view logging status.', ephemeral: false });
       }
 
       const config = getServerConfig(interaction.guild.id);
       const embed = new EmbedBuilder()
-        .setTitle('📊 Logging Configuration Status')
+        .setTitle(' Logging Configuration Status')
         .addFields(
           { 
-            name: '🎭 Reaction Logs', 
+            name: ' Reaction Logs', 
             value: config.reactionLogsChannel ? `<#${config.reactionLogsChannel}>` : 'Not configured', 
             inline: true 
           },
           { 
-            name: '🗑️ Deleted Message Logs', 
+            name: ' Deleted Message Logs', 
             value: config.deletedLogsChannel ? `<#${config.deletedLogsChannel}>` : 'Not configured', 
             inline: true 
           },
           { 
-            name: '✏️ Edit Message Logs', 
+            name: ' Edit Message Logs', 
             value: config.editLogsChannel ? `<#${config.editLogsChannel}>` : 'Not configured', 
             inline: true 
           }
@@ -805,7 +947,7 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'say') {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need administrator permissions to use this command.', ephemeral: true });
+        return interaction.reply({ content: 'You need administrator permissions to use this command.', ephemeral: true });
       }
 
       const targetChannel = interaction.options.getChannel('channel');
@@ -813,7 +955,7 @@ client.on('interactionCreate', async interaction => {
 
       // Verify the channel is a text channel in the same guild
       if (!targetChannel || targetChannel.type !== ChannelType.GuildText || targetChannel.guild.id !== interaction.guild.id) {
-        return interaction.reply({ content: '❌ Invalid channel selected. Please choose a text channel from this server.', ephemeral: true });
+        return interaction.reply({ content: 'Invalid channel selected. Please choose a text channel from this server.', ephemeral: true });
       }
 
       try {
@@ -821,13 +963,13 @@ client.on('interactionCreate', async interaction => {
         await targetChannel.send(messageText);
 
         return interaction.reply({ 
-          content: `✅ Message sent to ${targetChannel}`, 
+          content: ` Message sent to ${targetChannel}`, 
           ephemeral: true 
         });
       } catch (error) {
         console.error('Error sending message:', error);
         return interaction.reply({ 
-          content: '❌ Failed to send message. Check bot permissions for that channel.', 
+          content: 'Failed to send message. Check bot permissions for that channel.', 
           ephemeral: true 
         });
       }
@@ -835,7 +977,7 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'riskreport') {
       if (!isModerator(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need moderator permissions to use this command.', ephemeral: false });
+        return interaction.reply({ content: 'You need moderator permissions to use this command.', ephemeral: false });
       }
 
       await interaction.deferReply();
@@ -847,13 +989,13 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply({ embeds: [embed] });
       } catch (error) {
         console.error('Error generating risk report:', error);
-        return interaction.editReply({ content: '❌ Error generating server risk report. Please try again.' });
+        return interaction.editReply({ content: 'Error generating server risk report. Please try again.' });
       }
     }
 
     if (commandName === 'behavioursummary') {
       if (!isModerator(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need moderator permissions to use this command.', ephemeral: false });
+        return interaction.reply({ content: 'You need moderator permissions to use this command.', ephemeral: false });
       }
 
       await interaction.deferReply();
@@ -867,51 +1009,51 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply({ embeds });
       } catch (error) {
         console.error('Error generating behavior summary:', error);
-        return interaction.editReply({ content: '❌ Error generating behavior summary. Please try again.' });
+        return interaction.editReply({ content: 'Error generating behavior summary. Please try again.' });
       }
     }
 
     if (commandName === 'quarantine') {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need administrator permissions to quarantine users.', ephemeral: true });
+        return interaction.reply({ content: 'You need administrator permissions to quarantine users.', ephemeral: true });
       }
 
       const target = interaction.options.getUser('user');
       const member = await interaction.guild.members.fetch(target.id).catch(() => null);
 
       if (!member) {
-        return interaction.reply({ content: '❌ That user is not in this server.', ephemeral: true });
+        return interaction.reply({ content: 'That user is not in this server.', ephemeral: true });
       }
 
       if (isAdmin(member)) {
-        return interaction.reply({ content: '🛡️ You cannot quarantine an administrator.', ephemeral: true });
+        return interaction.reply({ content: 'You cannot quarantine an administrator.', ephemeral: true });
       }
 
       const quarantineRole = interaction.guild.roles.cache.find(r => r.name === 'Quarantined');
       if (quarantineRole && member.roles.cache.has(quarantineRole.id)) {
-        return interaction.reply({ content: `⚠️ **${target.tag}** is already quarantined.`, ephemeral: true });
+        return interaction.reply({ content: ` **${target.tag}** is already quarantined.`, ephemeral: true });
       }
 
       await interaction.deferReply();
       await quarantineUser(member, `Manually quarantined by ${interaction.user.tag}`);
-      return interaction.editReply({ content: `🔒 **${target.tag}** has been moved to quarantine.` });
+      return interaction.editReply({ content: ` **${target.tag}** has been moved to quarantine.` });
     }
 
     if (commandName === 'allow') {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need administrator permissions to release users from quarantine.', ephemeral: true });
+        return interaction.reply({ content: 'You need administrator permissions to release users from quarantine.', ephemeral: true });
       }
 
       const target = interaction.options.getUser('user');
       const member = await interaction.guild.members.fetch(target.id).catch(() => null);
 
       if (!member) {
-        return interaction.reply({ content: '❌ That user is not in this server.', ephemeral: true });
+        return interaction.reply({ content: 'That user is not in this server.', ephemeral: true });
       }
 
       const quarantineRole = interaction.guild.roles.cache.find(r => r.name === 'Quarantined');
       if (!quarantineRole || !member.roles.cache.has(quarantineRole.id)) {
-        return interaction.reply({ content: '⚠️ That user is not currently quarantined.', ephemeral: true });
+        return interaction.reply({ content: 'That user is not currently quarantined.', ephemeral: true });
       }
 
       await interaction.deferReply();
@@ -919,12 +1061,44 @@ client.on('interactionCreate', async interaction => {
         await member.roles.remove(quarantineRole);
         const quarantineChannel = interaction.guild.channels.cache.find(c => c.name === 'quarantine-room');
         if (quarantineChannel) {
-          await quarantineChannel.send(`✅ ${member} has been cleared from quarantine by a moderator and can now access the server.`).catch(() => {});
+          await quarantineChannel.send(` ${member} has been cleared from quarantine by a moderator and can now access the server.`).catch(() => {});
         }
-        return interaction.editReply({ content: `✅ **${target.tag}** has been released from quarantine.` });
+        return interaction.editReply({ content: ` **${target.tag}** has been released from quarantine.` });
       } catch (e) {
         console.error('Error removing quarantine role:', e);
-        return interaction.editReply({ content: '❌ Failed to remove quarantine role. Check my permissions.' });
+        return interaction.editReply({ content: 'Failed to remove quarantine role. Check my permissions.' });
+      }
+    }
+
+    if (commandName === 'advanced') {
+      const subcommand = interaction.options.getSubcommand();
+      if (subcommand === 'toggle') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: 'You need administrator permissions to configure advanced restrictions.', ephemeral: true });
+        }
+
+        const embed = new EmbedBuilder()
+          .setTitle('Advanced Security Configuration')
+          .setDescription('Select a text channel from the dropdown below to configure its content restrictions.\n\nYou can set a channel to **Messages Only** (text only, no images or videos) or **Media Only** (images and videos only, no text). You can also control which roles and users are subject to or exempt from these restrictions.')
+          .addFields(
+            { name: 'Messages Only', value: 'Allows text. Deletes any message containing images or video and returns the text to the sender.', inline: false },
+            { name: 'Media Only', value: 'Allows images and video. Deletes any message containing text and returns the media link to the sender.', inline: false }
+          )
+          .setColor(0x2B2D31)
+          .setFooter({ text: 'Administrators are always exempt from restrictions.' })
+          .setTimestamp();
+
+        const channelSelect = new ChannelSelectMenuBuilder()
+          .setCustomId(`adv_chan_${interaction.guild.id}`)
+          .setPlaceholder('Select a channel to configure')
+          .setChannelTypes([ChannelType.GuildText])
+          .setMinValues(1)
+          .setMaxValues(1);
+
+        return interaction.reply({
+          embeds: [embed],
+          components: [new ActionRowBuilder().addComponents(channelSelect)]
+        });
       }
     }
 
@@ -932,19 +1106,19 @@ client.on('interactionCreate', async interaction => {
       const subcommand = interaction.options.getSubcommand();
       if (subcommand === 'quarantine') {
         if (!isAdmin(interaction.member)) {
-          return interaction.reply({ content: '🚫 You need administrator permissions to configure quarantine.', ephemeral: true });
+          return interaction.reply({ content: 'You need administrator permissions to configure quarantine.', ephemeral: true });
         }
 
         const config = getServerConfig(interaction.guild.id);
         const qConfig = config.quarantine;
 
         const embed = new EmbedBuilder()
-          .setTitle('🔒 Quarantine Configuration')
+          .setTitle(' Quarantine Configuration')
           .setDescription('Toggle settings using the buttons below. Changes take effect immediately.')
           .addFields(
-            { name: 'Quarantine System', value: qConfig.enabled ? '✅ Enabled' : '❌ Disabled', inline: true },
-            { name: 'Account Age Check', value: qConfig.ageEnabled ? `✅ Enabled (< ${qConfig.ageThreshold} days)` : '❌ Disabled', inline: true },
-            { name: 'Mass Join Detection', value: qConfig.massJoinEnabled ? `✅ Enabled (${qConfig.massJoinCount} joins / ${qConfig.massJoinTime}min)` : '❌ Disabled', inline: true }
+            { name: 'Quarantine System', value: qConfig.enabled ? ' Enabled' : ' Disabled', inline: true },
+            { name: 'Account Age Check', value: qConfig.ageEnabled ? ` Enabled (< ${qConfig.ageThreshold} days)` : ' Disabled', inline: true },
+            { name: 'Mass Join Detection', value: qConfig.massJoinEnabled ? ` Enabled (${qConfig.massJoinCount} joins / ${qConfig.massJoinTime}min)` : ' Disabled', inline: true }
           )
           .setColor(0x5865F2)
           .setTimestamp();
@@ -969,7 +1143,7 @@ client.on('interactionCreate', async interaction => {
     }
   }
 
-  // ✅ Select menu interaction handler
+  //  Select menu interaction handler
   if (interaction.isStringSelectMenu()) {
     const customIdParts = interaction.customId.split('_');
     const action = customIdParts[0];
@@ -978,12 +1152,12 @@ client.on('interactionCreate', async interaction => {
 
     if (action === 'select' && guildId === interaction.guild.id) {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: '🚫 You need administrator permissions to configure logging.', ephemeral: false });
+        return interaction.reply({ content: 'You need administrator permissions to configure logging.', ephemeral: false });
       }
 
       const channelId = interaction.values[0];
       if (channelId === 'none') {
-        return interaction.reply({ content: '❌ No valid channels available. Create a text channel first.', ephemeral: false });
+        return interaction.reply({ content: 'No valid channels available. Create a text channel first.', ephemeral: false });
       }
 
       const config = getServerConfig(guildId);
@@ -992,41 +1166,86 @@ client.on('interactionCreate', async interaction => {
       if (logType === 'reaction') {
         config.reactionLogsChannel = channelId;
         serverConfigs.set(guildId, config);
-
-        return interaction.update({ 
-          content: `✅ Reaction logs configured for ${channel}`, 
-          embeds: [], 
-          components: [] 
-        });
+        return interaction.update({ content: `Reaction logs configured for ${channel}`, embeds: [], components: [] });
       } else if (logType === 'deleted') {
         config.deletedLogsChannel = channelId;
         serverConfigs.set(guildId, config);
-
-        return interaction.update({ 
-          content: `✅ Deleted message logs configured for ${channel}`, 
-          embeds: [], 
-          components: [] 
-        });
+        return interaction.update({ content: `Deleted message logs configured for ${channel}`, embeds: [], components: [] });
       } else if (logType === 'edit') {
         config.editLogsChannel = channelId;
         serverConfigs.set(guildId, config);
-
-        return interaction.update({ 
-          content: `✅ Message edit logs configured for ${channel}`, 
-          embeds: [], 
-          components: [] 
-        });
+        return interaction.update({ content: `Message edit logs configured for ${channel}`, embeds: [], components: [] });
       }
     }
   }
 
-  // ✅ Button interaction handler
+  // Advanced config: channel select
+  if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('adv_chan_')) {
+    if (!isAdmin(interaction.member)) {
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+    }
+    const channelId = interaction.values[0];
+    const panel = buildAdvancedPanel(interaction.guild, channelId);
+    return interaction.update(panel);
+  }
+
+  // Advanced config: restricted roles select
+  if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('adv_roles_restrict_')) {
+    if (!isAdmin(interaction.member)) {
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+    }
+    const channelId = interaction.customId.replace('adv_roles_restrict_', '');
+    const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
+    cfg.restrictedRoles = interaction.values;
+    const panel = buildAdvancedPanel(interaction.guild, channelId);
+    return interaction.update(panel);
+  }
+
+  // Advanced config: exempt roles select
+  if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('adv_roles_exempt_')) {
+    if (!isAdmin(interaction.member)) {
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+    }
+    const channelId = interaction.customId.replace('adv_roles_exempt_', '');
+    const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
+    cfg.exemptRoles = interaction.values;
+    const panel = buildAdvancedPanel(interaction.guild, channelId);
+    return interaction.update(panel);
+  }
+
+  // Advanced config: exempt users select
+  if (interaction.isUserSelectMenu() && interaction.customId.startsWith('adv_users_exempt_')) {
+    if (!isAdmin(interaction.member)) {
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+    }
+    const channelId = interaction.customId.replace('adv_users_exempt_', '');
+    const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
+    cfg.exemptUsers = interaction.values;
+    const panel = buildAdvancedPanel(interaction.guild, channelId);
+    return interaction.update(panel);
+  }
+
+  //  Button interaction handler
   if (!interaction.isButton()) return;
+
+  // Advanced config: mode buttons
+  if (interaction.customId.startsWith('adv_mode_')) {
+    if (!isAdmin(interaction.member)) {
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+    }
+    const parts = interaction.customId.split('_');
+    const mode = parts[2];
+    const channelId = parts.slice(3).join('_');
+    const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
+    cfg.mode = mode === 'off' ? null : mode === 'messages' ? 'messages_only' : 'media_only';
+    const panel = buildAdvancedPanel(interaction.guild, channelId);
+    return interaction.update(panel);
+  }
 
   // Handle quarantine config toggle buttons
   if (interaction.customId.startsWith('qconfig_')) {
     if (!isAdmin(interaction.member)) {
-      return interaction.reply({ content: '🚫 You need administrator permissions.', ephemeral: true });
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
     }
 
     const parts = interaction.customId.split('_');
@@ -1048,12 +1267,12 @@ client.on('interactionCreate', async interaction => {
     serverConfigs.set(guildId, config);
 
     const embed = new EmbedBuilder()
-      .setTitle('🔒 Quarantine Configuration')
+      .setTitle(' Quarantine Configuration')
       .setDescription('Toggle settings using the buttons below. Changes take effect immediately.')
       .addFields(
-        { name: 'Quarantine System', value: qConfig.enabled ? '✅ Enabled' : '❌ Disabled', inline: true },
-        { name: 'Account Age Check', value: qConfig.ageEnabled ? `✅ Enabled (< ${qConfig.ageThreshold} days)` : '❌ Disabled', inline: true },
-        { name: 'Mass Join Detection', value: qConfig.massJoinEnabled ? `✅ Enabled (${qConfig.massJoinCount} joins / ${qConfig.massJoinTime}min)` : '❌ Disabled', inline: true }
+        { name: 'Quarantine System', value: qConfig.enabled ? ' Enabled' : ' Disabled', inline: true },
+        { name: 'Account Age Check', value: qConfig.ageEnabled ? ` Enabled (< ${qConfig.ageThreshold} days)` : ' Disabled', inline: true },
+        { name: 'Mass Join Detection', value: qConfig.massJoinEnabled ? ` Enabled (${qConfig.massJoinCount} joins / ${qConfig.massJoinTime}min)` : ' Disabled', inline: true }
       )
       .setColor(0x5865F2)
       .setTimestamp();
@@ -1081,28 +1300,28 @@ client.on('interactionCreate', async interaction => {
   const member = await interaction.guild.members.fetch(userId).catch(() => null);
 
   if (!targetUser) {
-    return interaction.reply({ content: '⚠️ User not found.', ephemeral: false });
+    return interaction.reply({ content: 'User not found.', ephemeral: false });
   }
 
   // Check if target is admin (immune to moderation)
   const isTargetAdmin = member && isAdmin(member);
 
   if (action === 'allow') {
-    return interaction.update({ content: `✅ Allowed **${targetUser.tag}**`, components: [], embeds: interaction.message.embeds });
+    return interaction.update({ content: ` Allowed **${targetUser.tag}**`, components: [], embeds: interaction.message.embeds });
   }
 
   if (action === 'kick') {
     if (!interaction.member.permissions.has('KickMembers')) {
-      return interaction.reply({ content: '🚫 You do not have permission to kick.', ephemeral: false });
+      return interaction.reply({ content: 'You do not have permission to kick.', ephemeral: false });
     }
-    if (!member) return interaction.reply({ content: '⚠️ User is not in the server.', ephemeral: false });
+    if (!member) return interaction.reply({ content: 'User is not in the server.', ephemeral: false });
 
     if (isTargetAdmin) {
-      return interaction.reply({ content: '🛡️ Cannot kick this user - they have administrator privileges.', ephemeral: false });
+      return interaction.reply({ content: 'Cannot kick this user - they have administrator privileges.', ephemeral: false });
     }
 
     return interaction.reply({
-      content: `⚠️ Are you sure you want to **kick** ${targetUser.tag}?`,
+      content: ` Are you sure you want to **kick** ${targetUser.tag}?`,
       components: [
         new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(`confirmkick_${userId}`).setLabel('Yes, Kick').setStyle(ButtonStyle.Danger),
@@ -1115,16 +1334,16 @@ client.on('interactionCreate', async interaction => {
 
   if (action === 'ban') {
     if (!interaction.member.permissions.has('BanMembers')) {
-      return interaction.reply({ content: '🚫 You do not have permission to ban.', ephemeral: false });
+      return interaction.reply({ content: 'You do not have permission to ban.', ephemeral: false });
     }
-    if (!member) return interaction.reply({ content: '⚠️ User is not in the server.', ephemeral: false });
+    if (!member) return interaction.reply({ content: 'User is not in the server.', ephemeral: false });
 
     if (isTargetAdmin) {
-      return interaction.reply({ content: '🛡️ Cannot ban this user - they have administrator privileges.', ephemeral: false });
+      return interaction.reply({ content: 'Cannot ban this user - they have administrator privileges.', ephemeral: false });
     }
 
     return interaction.reply({
-      content: `⚠️ Are you sure you want to **ban** ${targetUser.tag}?`,
+      content: ` Are you sure you want to **ban** ${targetUser.tag}?`,
       components: [
         new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(`confirmban_${userId}`).setLabel('Yes, Ban').setStyle(ButtonStyle.Danger),
@@ -1137,22 +1356,22 @@ client.on('interactionCreate', async interaction => {
 
   if (action === 'confirmkick') {
     if (isTargetAdmin) {
-      return interaction.update({ content: '🛡️ Cannot kick this user - they have administrator privileges.', components: [] });
+      return interaction.update({ content: 'Cannot kick this user - they have administrator privileges.', components: [] });
     }
     await member.kick(`Kicked by ${interaction.user.tag} via alt check`).catch(() => null);
-    return interaction.update({ content: `👢 Kicked **${targetUser.tag}**`, components: [] });
+    return interaction.update({ content: ` Kicked **${targetUser.tag}**`, components: [] });
   }
 
   if (action === 'confirmban') {
     if (isTargetAdmin) {
-      return interaction.update({ content: '🛡️ Cannot ban this user - they have administrator privileges.', components: [] });
+      return interaction.update({ content: 'Cannot ban this user - they have administrator privileges.', components: [] });
     }
     await member.ban({ reason: `Banned by ${interaction.user.tag} via alt check` }).catch(() => null);
-    return interaction.update({ content: `🔨 Banned **${targetUser.tag}**`, components: [] });
+    return interaction.update({ content: ` Banned **${targetUser.tag}**`, components: [] });
   }
 
   if (action === 'cancel') {
-    return interaction.update({ content: '❎ Action cancelled.', components: [] });
+    return interaction.update({ content: 'Action cancelled.', components: [] });
   }
 
   } catch (error) {
@@ -1160,13 +1379,13 @@ client.on('interactionCreate', async interaction => {
 
     if (!interaction.replied && !interaction.deferred) {
       try {
-        await interaction.reply({ content: '❌ An error occurred while processing your request.', ephemeral: true });
+        await interaction.reply({ content: 'An error occurred while processing your request.', ephemeral: true });
       } catch (e) {
         console.error('Failed to send error reply:', e);
       }
     } else {
       try {
-        await interaction.followUp({ content: '❌ An error occurred while processing your request.', ephemeral: true });
+        await interaction.followUp({ content: 'An error occurred while processing your request.', ephemeral: true });
       } catch (e) {
         console.error('Failed to send error followup:', e);
       }
@@ -1174,7 +1393,7 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// ✅ Message deleted event handler
+//  Message deleted event handler
 client.on('messageDelete', async message => {
   // Ignore bot messages and system messages
   if (!message.author || message.author.bot || message.system) return;
@@ -1197,7 +1416,7 @@ client.on('messageDelete', async message => {
 
   if (message.content) {
     embed.addFields({ 
-      name: '💬 Content', 
+      name: ' Content', 
       value: message.content.length > 1024 ? `${message.content.substring(0, 1021)}...` : message.content,
       inline: false 
     });
@@ -1206,7 +1425,7 @@ client.on('messageDelete', async message => {
   if (message.attachments.size > 0) {
     const attachmentList = message.attachments.map(att => `[${att.name}](${att.url})`).join('\n');
     embed.addFields({ 
-      name: '📎 Attachments', 
+      name: ' Attachments', 
       value: attachmentList.length > 1024 ? `${attachmentList.substring(0, 1021)}...` : attachmentList,
       inline: false 
     });
@@ -1221,7 +1440,7 @@ client.on('messageDelete', async message => {
   }
 });
 
-// ✅ Message edited event handler
+//  Message edited event handler
 client.on('messageUpdate', async (oldMessage, newMessage) => {
   // Ignore bot messages, system messages, and messages without content changes
   if (!newMessage.author || newMessage.author.bot || newMessage.system) return;
@@ -1234,10 +1453,10 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
   if (!logChannel) return;
 
   const embed = new EmbedBuilder()
-    .setTitle('✏️ Message Edited')
+    .setTitle(' Message Edited')
     .setColor(0xFFA500)
     .addFields(
-      { name: '👤 Author', value: `${newMessage.author.tag} (${newMessage.author.id})`, inline: true },
+      { name: ' Author', value: `${newMessage.author.tag} (${newMessage.author.id})`, inline: true },
       { name: 'Channel', value: `${newMessage.channel}`, inline: true },
       { name: 'Edited At', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
     )
@@ -1245,7 +1464,7 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
 
   if (oldMessage.content) {
     embed.addFields({ 
-      name: '📝 Before', 
+      name: ' Before', 
       value: oldMessage.content.length > 512 ? `${oldMessage.content.substring(0, 509)}...` : oldMessage.content,
       inline: false 
     });
@@ -1253,14 +1472,14 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
 
   if (newMessage.content) {
     embed.addFields({ 
-      name: '📝 After', 
+      name: ' After', 
       value: newMessage.content.length > 512 ? `${newMessage.content.substring(0, 509)}...` : newMessage.content,
       inline: false 
     });
   }
 
   embed.addFields({ 
-    name: '🔗 Jump to Message', 
+    name: ' Jump to Message', 
     value: `[Click here](${newMessage.url})`,
     inline: true 
   });
@@ -1274,7 +1493,7 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
   }
 });
 
-// ✅ Reaction added event handler
+//  Reaction added event handler
 client.on('messageReactionAdd', async (reaction, user) => {
   // Ignore bot reactions
   if (user.bot) return;
@@ -1296,7 +1515,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
   if (!logChannel) return;
 
   const embed = new EmbedBuilder()
-    .setTitle('🎭 Reaction Added')
+    .setTitle(' Reaction Added')
     .setColor(0x00FF00)
     .addFields(
       { name: 'User', value: `${user.tag} (${user.id})`, inline: true },
@@ -1312,7 +1531,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
     const content = reaction.message.content.length > 200 ? 
       `${reaction.message.content.substring(0, 197)}...` : 
       reaction.message.content;
-    embed.addFields({ name: '💬 Message Content', value: content, inline: false });
+    embed.addFields({ name: ' Message Content', value: content, inline: false });
   }
 
   embed.setFooter({ 
@@ -1326,7 +1545,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
   }
 });
 
-// ✅ Reaction removed event handler
+//  Reaction removed event handler
 client.on('messageReactionRemove', async (reaction, user) => {
   // Ignore bot reactions
   if (user.bot) return;
@@ -1364,7 +1583,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
     const content = reaction.message.content.length > 200 ? 
       `${reaction.message.content.substring(0, 197)}...` : 
       reaction.message.content;
-    embed.addFields({ name: '💬 Message Content', value: content, inline: false });
+    embed.addFields({ name: ' Message Content', value: content, inline: false });
   }
 
   embed.setFooter({ 
@@ -1378,7 +1597,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
   }
 });
 
-// ✅ Auto-quarantine on member join
+//  Auto-quarantine on member join
 client.on('guildMemberAdd', async member => {
   const config = getServerConfig(member.guild.id);
   if (!config.quarantine.enabled) return;
@@ -1420,7 +1639,7 @@ client.on('guildMemberAdd', async member => {
   }
 });
 
-// ✅ Server Risk Assessment Functions
+//  Server Risk Assessment Functions
 async function generateServerRiskReport(guild, requestingUser) {
   const report = {
     serverInfo: {
@@ -1607,7 +1826,7 @@ function generateRecommendations(report) {
   }
 
   if (recommendations.length === 0) {
-    recommendations.push('✅ You have pretty great security going on in your server. keep it up :>');
+    recommendations.push(' You have pretty great security going on in your server. keep it up :>');
   }
 
   report.recommendations = recommendations.slice(0, 5); // Limit to 5 recommendations
@@ -1693,7 +1912,7 @@ async function createRiskReportEmbed(report, guild) {
   return embed;
 }
 
-// ✅ Behavior Analysis Functions
+//  Behavior Analysis Functions
 async function analyzeBehaviorSummary(user, guild) {
   const behaviorData = {
     userInfo: {
@@ -1949,7 +2168,7 @@ async function createBehaviorSummaryEmbeds(behaviorData, user, guild) {
       `Activity Timeline (${daysSinceJoin} days - Showing pattern)`;
 
     embed.addFields({
-      name: `📈 ${timelineTitle}`,
+      name: ` ${timelineTitle}`,
       value: `\`\`\`\n${graphData}\n\`\`\``,
       inline: false
     });
