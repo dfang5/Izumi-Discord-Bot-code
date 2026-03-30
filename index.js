@@ -1,7 +1,40 @@
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ChannelType, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, RoleSelectMenuBuilder, UserSelectMenuBuilder, ChannelSelectMenuBuilder } = require('discord.js');
 const { calculateRisk } = require('./risks');
 const { makeCheckEmbed } = require('./embeds');
+const mongoose = require('mongoose');
 require('dotenv').config();
+
+const ServerConfigSchema = new mongoose.Schema({
+  guildId: { type: String, required: true, unique: true },
+  reactionLogsChannel: { type: String, default: null },
+  deletedLogsChannel: { type: String, default: null },
+  editLogsChannel: { type: String, default: null },
+  warnDeleteTimeout: { type: Number, default: 60 },
+  quarantine: {
+    enabled: { type: Boolean, default: false },
+    ageThreshold: { type: Number, default: 0 },
+    ageEnabled: { type: Boolean, default: false },
+    massJoinEnabled: { type: Boolean, default: false },
+    massJoinTime: { type: Number, default: 5 },
+    massJoinCount: { type: Number, default: 10 },
+    profileCheckEnabled: { type: Boolean, default: false },
+    linkCheckEnabled: { type: Boolean, default: false }
+  }
+});
+
+const AdvancedChannelConfigSchema = new mongoose.Schema({
+  guildId: { type: String, required: true },
+  channelId: { type: String, required: true },
+  mode: { type: String, default: null },
+  restrictedRoles: { type: [String], default: [] },
+  restrictedUsers: { type: [String], default: [] },
+  exemptRoles: { type: [String], default: [] },
+  exemptUsers: { type: [String], default: [] }
+});
+AdvancedChannelConfigSchema.index({ guildId: 1, channelId: 1 }, { unique: true });
+
+const ServerConfigModel = mongoose.model('IzumiServerConfig', ServerConfigSchema);
+const AdvancedChannelConfigModel = mongoose.model('IzumiAdvancedConfig', AdvancedChannelConfigSchema);
 
 const client = new Client({
   intents: [
@@ -168,6 +201,7 @@ function getServerConfig(guildId) {
       reactionLogsChannel: null,
       deletedLogsChannel: null,
       editLogsChannel: null,
+      warnDeleteTimeout: 60,
       quarantine: {
         enabled: false,
         ageThreshold: 0,
@@ -179,6 +213,9 @@ function getServerConfig(guildId) {
         linkCheckEnabled: false
       }
     });
+  }
+  if (serverConfigs.get(guildId).warnDeleteTimeout === undefined) {
+    serverConfigs.get(guildId).warnDeleteTimeout = 60;
   }
   return serverConfigs.get(guildId);
 }
@@ -225,6 +262,13 @@ async function checkAdvancedRestrictions(message) {
   if (!member || isAdmin(member)) return false;
   if (!isSubjectToAdvancedRestriction(member, channelCfg)) return false;
 
+  const warnTimeout = getServerConfig(message.guild.id).warnDeleteTimeout;
+  const scheduleDelete = (msg) => {
+    if (warnTimeout !== null) {
+      setTimeout(() => msg.delete().catch(() => {}), warnTimeout * 1000);
+    }
+  };
+
   if (channelCfg.mode === 'messages_only') {
     const hasMedia = message.attachments.some(a =>
       a.contentType?.startsWith('image/') || a.contentType?.startsWith('video/')
@@ -239,26 +283,23 @@ async function checkAdvancedRestrictions(message) {
             ? `Your text has been saved. Copy and resend it:\n\`\`\`\n${savedText.substring(0, 1800)}\n\`\`\``
             : 'Your message contained no text content.')
       });
-      setTimeout(() => response.delete().catch(() => {}), 60000);
+      scheduleDelete(response);
       return true;
     }
   }
 
   if (channelCfg.mode === 'media_only') {
     const hasText = message.content && message.content.trim().length > 0;
-    if (hasText) {
-      const mediaUrls = message.attachments
-        .filter(a => a.contentType?.startsWith('image/') || a.contentType?.startsWith('video/'))
-        .map(a => a.url)
-        .join('\n');
+    const hasMedia = message.attachments.some(a =>
+      a.contentType?.startsWith('image/') || a.contentType?.startsWith('video/')
+    );
+    if (hasText && !hasMedia) {
       await message.delete().catch(() => {});
       const response = await message.channel.send({
-        content: `${member}, this channel is set to **media only**. Your message was removed because it contained text.\n\n` +
-          (mediaUrls
-            ? `Your media has been saved. Use the link(s) below to repost:\n${mediaUrls}`
-            : 'Your message contained no media.')
+        content: `${member}, this channel is set to **media only**. Your message was removed because it contained no media.\n\n` +
+          'Please include an image or video with your message.'
       });
-      setTimeout(() => response.delete().catch(() => {}), 60000);
+      scheduleDelete(response);
       return true;
     }
   }
@@ -270,6 +311,9 @@ function buildAdvancedPanel(guild, channelId) {
   const guildCfg = getAdvancedGuildConfig(guild.id);
   const channel = guild.channels.cache.get(channelId);
   const cfg = guildCfg.has(channelId) ? guildCfg.get(channelId) : { mode: null, restrictedRoles: [], exemptRoles: [], exemptUsers: [] };
+  const serverCfg = getServerConfig(guild.id);
+  const timeout = serverCfg.warnDeleteTimeout;
+  const timeoutLabel = timeout === null ? 'Never' : timeout < 60 ? `${timeout}s` : `${timeout / 60}min`;
 
   const modeLabel = cfg.mode === 'messages_only' ? 'Messages Only'
     : cfg.mode === 'media_only' ? 'Media Only'
@@ -296,11 +340,11 @@ function buildAdvancedPanel(guild, channelId) {
     .setDescription('Configure content restrictions for this channel. Mode changes apply immediately.')
     .addFields(
       { name: 'Current Mode', value: `**${modeLabel}**`, inline: true },
-      { name: 'Restricted To', value: restrictedText, inline: true },
+      { name: 'Warning Auto-Delete', value: `**${timeoutLabel}**`, inline: true },
       { name: '\u200b', value: '\u200b', inline: true },
+      { name: 'Restricted To', value: restrictedText, inline: true },
       { name: 'Exempt Roles', value: exemptRolesText, inline: true },
-      { name: 'Exempt Users', value: exemptUsersText, inline: true },
-      { name: '\u200b', value: '\u200b', inline: true }
+      { name: 'Exempt Users', value: exemptUsersText, inline: true }
     )
     .setColor(modeColor)
     .setFooter({ text: 'Administrators are always exempt. Use the selects below to manage roles and users.' })
@@ -325,7 +369,11 @@ function buildAdvancedPanel(guild, channelId) {
     new ButtonBuilder()
       .setCustomId(`adv_mode_off_${channelId}`)
       .setLabel('Unrestricted')
-      .setStyle(!cfg.mode ? ButtonStyle.Success : ButtonStyle.Secondary)
+      .setStyle(!cfg.mode ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`adv_timer_${channelId}`)
+      .setLabel(`Warning Timer: ${timeoutLabel}`)
+      .setStyle(ButtonStyle.Secondary)
   );
 
   const restrictRolesSelect = new RoleSelectMenuBuilder()
@@ -357,6 +405,89 @@ function buildAdvancedPanel(guild, channelId) {
     ]
   };
 }
+
+// ---- MongoDB persistence ----
+
+async function connectDB() {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI);
+    console.log('Connected to MongoDB');
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+  }
+}
+
+async function saveServerConfig(guildId) {
+  try {
+    const data = serverConfigs.get(guildId);
+    if (!data) return;
+    await ServerConfigModel.findOneAndUpdate(
+      { guildId },
+      { guildId, ...data },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+  } catch (err) {
+    console.error(`Failed to save server config for ${guildId}:`, err);
+  }
+}
+
+async function saveAdvancedChannelConfig(guildId, channelId) {
+  try {
+    const guildCfg = advancedConfig.get(guildId);
+    if (!guildCfg) return;
+    const data = guildCfg.get(channelId);
+    if (!data) return;
+    await AdvancedChannelConfigModel.findOneAndUpdate(
+      { guildId, channelId },
+      { guildId, channelId, ...data },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+  } catch (err) {
+    console.error(`Failed to save advanced config for ${guildId}/${channelId}:`, err);
+  }
+}
+
+async function loadAllConfigs() {
+  try {
+    const serverDocs = await ServerConfigModel.find({}).lean();
+    for (const doc of serverDocs) {
+      serverConfigs.set(doc.guildId, {
+        reactionLogsChannel: doc.reactionLogsChannel ?? null,
+        deletedLogsChannel: doc.deletedLogsChannel ?? null,
+        editLogsChannel: doc.editLogsChannel ?? null,
+        warnDeleteTimeout: doc.warnDeleteTimeout !== undefined ? doc.warnDeleteTimeout : 60,
+        quarantine: {
+          enabled: doc.quarantine?.enabled ?? false,
+          ageThreshold: doc.quarantine?.ageThreshold ?? 0,
+          ageEnabled: doc.quarantine?.ageEnabled ?? false,
+          massJoinEnabled: doc.quarantine?.massJoinEnabled ?? false,
+          massJoinTime: doc.quarantine?.massJoinTime ?? 5,
+          massJoinCount: doc.quarantine?.massJoinCount ?? 10,
+          profileCheckEnabled: doc.quarantine?.profileCheckEnabled ?? false,
+          linkCheckEnabled: doc.quarantine?.linkCheckEnabled ?? false
+        }
+      });
+    }
+
+    const advancedDocs = await AdvancedChannelConfigModel.find({}).lean();
+    for (const doc of advancedDocs) {
+      if (!advancedConfig.has(doc.guildId)) advancedConfig.set(doc.guildId, new Map());
+      advancedConfig.get(doc.guildId).set(doc.channelId, {
+        mode: doc.mode ?? null,
+        restrictedRoles: doc.restrictedRoles ?? [],
+        restrictedUsers: doc.restrictedUsers ?? [],
+        exemptRoles: doc.exemptRoles ?? [],
+        exemptUsers: doc.exemptUsers ?? []
+      });
+    }
+
+    console.log(`Loaded ${serverDocs.length} server config(s) and ${advancedDocs.length} advanced channel config(s) from MongoDB`);
+  } catch (err) {
+    console.error('Failed to load configs from MongoDB:', err);
+  }
+}
+
+// ---- End MongoDB persistence ----
 
 // ---- End advanced config helpers ----
 
@@ -507,6 +638,9 @@ async function analyzeMutualConnections(targetUser, requestingUser, client) {
 //  Bot login and slash command registration
 client.once('ready', async () => {
   console.log(` Logged in as ${client.user.tag}`);
+
+  await connectDB();
+  await loadAllConfigs();
 
   // Register slash commands
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
@@ -1082,7 +1216,7 @@ client.on('interactionCreate', async interaction => {
           .setDescription('Select a text channel from the dropdown below to configure its content restrictions.\n\nYou can set a channel to **Messages Only** (text only, no images or videos) or **Media Only** (images and videos only, no text). You can also control which roles and users are subject to or exempt from these restrictions.')
           .addFields(
             { name: 'Messages Only', value: 'Allows text. Deletes any message containing images or video and returns the text to the sender.', inline: false },
-            { name: 'Media Only', value: 'Allows images and video. Deletes any message containing text and returns the media link to the sender.', inline: false }
+            { name: 'Media Only', value: 'Allows images and video. Text-only messages are deleted, but messages that include both text and media are allowed.', inline: false }
           )
           .setColor(0x2B2D31)
           .setFooter({ text: 'Administrators are always exempt from restrictions.' })
@@ -1166,14 +1300,17 @@ client.on('interactionCreate', async interaction => {
       if (logType === 'reaction') {
         config.reactionLogsChannel = channelId;
         serverConfigs.set(guildId, config);
+        saveServerConfig(guildId).catch(console.error);
         return interaction.update({ content: `Reaction logs configured for ${channel}`, embeds: [], components: [] });
       } else if (logType === 'deleted') {
         config.deletedLogsChannel = channelId;
         serverConfigs.set(guildId, config);
+        saveServerConfig(guildId).catch(console.error);
         return interaction.update({ content: `Deleted message logs configured for ${channel}`, embeds: [], components: [] });
       } else if (logType === 'edit') {
         config.editLogsChannel = channelId;
         serverConfigs.set(guildId, config);
+        saveServerConfig(guildId).catch(console.error);
         return interaction.update({ content: `Message edit logs configured for ${channel}`, embeds: [], components: [] });
       }
     }
@@ -1197,6 +1334,7 @@ client.on('interactionCreate', async interaction => {
     const channelId = interaction.customId.replace('adv_roles_restrict_', '');
     const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
     cfg.restrictedRoles = interaction.values;
+    saveAdvancedChannelConfig(interaction.guild.id, channelId).catch(console.error);
     const panel = buildAdvancedPanel(interaction.guild, channelId);
     return interaction.update(panel);
   }
@@ -1209,6 +1347,7 @@ client.on('interactionCreate', async interaction => {
     const channelId = interaction.customId.replace('adv_roles_exempt_', '');
     const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
     cfg.exemptRoles = interaction.values;
+    saveAdvancedChannelConfig(interaction.guild.id, channelId).catch(console.error);
     const panel = buildAdvancedPanel(interaction.guild, channelId);
     return interaction.update(panel);
   }
@@ -1221,6 +1360,26 @@ client.on('interactionCreate', async interaction => {
     const channelId = interaction.customId.replace('adv_users_exempt_', '');
     const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
     cfg.exemptUsers = interaction.values;
+    saveAdvancedChannelConfig(interaction.guild.id, channelId).catch(console.error);
+    const panel = buildAdvancedPanel(interaction.guild, channelId);
+    return interaction.update(panel);
+  }
+
+  // Advanced config: warning timer modal submission
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('adv_timer_modal_')) {
+    if (!isAdmin(interaction.member)) {
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+    }
+    const channelId = interaction.customId.replace('adv_timer_modal_', '');
+    const raw = interaction.fields.getTextInputValue('timer_value').trim();
+    const parsed = parseInt(raw, 10);
+    if (isNaN(parsed) || parsed < 0) {
+      return interaction.reply({ content: 'Please enter a valid number of seconds (0 for never).', ephemeral: true });
+    }
+    const serverCfg = getServerConfig(interaction.guild.id);
+    serverCfg.warnDeleteTimeout = parsed === 0 ? null : parsed;
+    serverConfigs.set(interaction.guild.id, serverCfg);
+    saveServerConfig(interaction.guild.id).catch(console.error);
     const panel = buildAdvancedPanel(interaction.guild, channelId);
     return interaction.update(panel);
   }
@@ -1238,8 +1397,31 @@ client.on('interactionCreate', async interaction => {
     const channelId = parts.slice(3).join('_');
     const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
     cfg.mode = mode === 'off' ? null : mode === 'messages' ? 'messages_only' : 'media_only';
+    saveAdvancedChannelConfig(interaction.guild.id, channelId).catch(console.error);
     const panel = buildAdvancedPanel(interaction.guild, channelId);
     return interaction.update(panel);
+  }
+
+  // Advanced config: warning timer button — opens a modal
+  if (interaction.customId.startsWith('adv_timer_')) {
+    if (!isAdmin(interaction.member)) {
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+    }
+    const channelId = interaction.customId.replace('adv_timer_', '');
+    const serverCfg = getServerConfig(interaction.guild.id);
+    const current = serverCfg.warnDeleteTimeout === null ? '0' : String(serverCfg.warnDeleteTimeout);
+    const modal = new ModalBuilder()
+      .setCustomId(`adv_timer_modal_${channelId}`)
+      .setTitle('Set Warning Message Timer');
+    const input = new TextInputBuilder()
+      .setCustomId('timer_value')
+      .setLabel('Delete after how many seconds? (0 = never delete)')
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder('e.g. 30, 60, 300 — enter 0 for infinite')
+      .setValue(current)
+      .setRequired(true);
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+    return interaction.showModal(modal);
   }
 
   // Handle quarantine config toggle buttons
@@ -1265,6 +1447,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     serverConfigs.set(guildId, config);
+    saveServerConfig(guildId).catch(console.error);
 
     const embed = new EmbedBuilder()
       .setTitle(' Quarantine Configuration')
