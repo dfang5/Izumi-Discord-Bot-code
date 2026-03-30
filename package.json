@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "prestart": "npm install",
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js": "^14.22.1",
-    "dotenv": "^16.4.5"
+    "discord.js": "^14.25.1",
+    "dotenv": "^16.4.5",
+    "mongoose": "^9.3.3"
   }
 }
+
