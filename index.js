@@ -2257,5 +2257,3 @@ function buildActivityEmbed(user, days, activityData) {
 
 
 client.login(process.env.TOKEN);
-
-获取 Outlook for iOS
