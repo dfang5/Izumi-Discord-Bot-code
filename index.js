@@ -36,6 +36,18 @@ AdvancedChannelConfigSchema.index({ guildId: 1, channelId: 1 }, { unique: true }
 const ServerConfigModel = mongoose.model('IzumiServerConfig', ServerConfigSchema);
 const AdvancedChannelConfigModel = mongoose.model('IzumiAdvancedConfig', AdvancedChannelConfigSchema);
 
+const ActivityLogSchema = new mongoose.Schema({
+  guildId: { type: String, required: true },
+  userId: { type: String, required: true },
+  date: { type: String, required: true },
+  messages: { type: Number, default: 0 },
+  links: { type: Number, default: 0 },
+  mentions: { type: Number, default: 0 },
+  uniqueChannels: { type: [String], default: [] }
+});
+ActivityLogSchema.index({ guildId: 1, userId: 1, date: 1 }, { unique: true });
+const ActivityLogModel = mongoose.model('IzumiActivityLog', ActivityLogSchema);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -661,8 +673,18 @@ client.once('ready', async () => {
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
-  // Advanced content restriction enforcement
   if (message.guild) {
+    // Real-time activity tracking
+    const today = new Date().toISOString().split('T')[0];
+    const linkCount = (message.content.match(/(https?:\/\/[^\s]+)/g) || []).length;
+    const mentionCount = message.mentions.users.size + message.mentions.roles.size;
+    ActivityLogModel.findOneAndUpdate(
+      { guildId: message.guild.id, userId: message.author.id, date: today },
+      { $inc: { messages: 1, links: linkCount, mentions: mentionCount }, $addToSet: { uniqueChannels: message.channel.id } },
+      { upsert: true }
+    ).catch(err => console.error('Activity log error:', err));
+
+    // Advanced content restriction enforcement
     const handled = await checkAdvancedRestrictions(message);
     if (handled) return;
   }
@@ -730,12 +752,12 @@ client.on('messageCreate', async message => {
     }
 
     try {
-      const behaviorData = await analyzeBehaviorSummary(target, message.guild);
-      const embeds = await createBehaviorSummaryEmbeds(behaviorData, target, message.guild);
-      return message.reply({ embeds });
+      const activityData = await getActivityData(message.guild.id, target.id, 14);
+      const { embed, components } = buildActivityEmbed(target, 14, activityData);
+      return message.reply({ embeds: [embed], components });
     } catch (error) {
-      console.error('Error generating behavior summary:', error);
-      return message.reply('Error generating behavior summary. Please try again.');
+      console.error('Error generating behaviour summary:', error);
+      return message.reply('Error generating behaviour summary. Please try again.');
     }
   }
 
@@ -1137,13 +1159,12 @@ client.on('interactionCreate', async interaction => {
       const target = interaction.options.getUser('user');
 
       try {
-        const behaviorData = await analyzeBehaviorSummary(target, interaction.guild);
-        const embeds = await createBehaviorSummaryEmbeds(behaviorData, target, interaction.guild);
-
-        return interaction.editReply({ embeds });
+        const activityData = await getActivityData(interaction.guild.id, target.id, 14);
+        const { embed, components } = buildActivityEmbed(target, 14, activityData);
+        return interaction.editReply({ embeds: [embed], components });
       } catch (error) {
-        console.error('Error generating behavior summary:', error);
-        return interaction.editReply({ content: 'Error generating behavior summary. Please try again.' });
+        console.error('Error generating behaviour summary:', error);
+        return interaction.editReply({ content: 'Error generating behaviour summary. Please try again.' });
       }
     }
 
@@ -1400,6 +1421,22 @@ client.on('interactionCreate', async interaction => {
     saveAdvancedChannelConfig(interaction.guild.id, channelId).catch(console.error);
     const panel = buildAdvancedPanel(interaction.guild, channelId);
     return interaction.update(panel);
+  }
+
+  // Behaviour summary period navigation buttons
+  if (interaction.customId.startsWith('bsum_')) {
+    const parts = interaction.customId.split('_');
+    const days = parseInt(parts[1]);
+    const userId = parts[2];
+    try {
+      const user = await interaction.client.users.fetch(userId);
+      const activityData = await getActivityData(interaction.guild.id, userId, days);
+      const { embed, components } = buildActivityEmbed(user, days, activityData);
+      return interaction.update({ embeds: [embed], components });
+    } catch (error) {
+      console.error('Error updating behaviour summary:', error);
+      return interaction.reply({ content: 'Failed to load activity data.', ephemeral: true });
+    }
   }
 
   // Advanced config: warning timer button — opens a modal
@@ -2095,348 +2132,130 @@ async function createRiskReportEmbed(report, guild) {
   return embed;
 }
 
-//  Behavior Analysis Functions
-async function analyzeBehaviorSummary(user, guild) {
-  const behaviorData = {
-    userInfo: {
-      id: user.id,
-      tag: user.tag,
-      joinedAt: null,
-      accountCreated: user.createdTimestamp
-    },
-    messageStats: {
-      totalMessages: 0,
-      totalLinks: 0,
-      totalMentions: 0,
-      averageMessagesPerDay: 0,
-      peakActivityDay: null,
-      peakActivityCount: 0
-    },
-    activityTimeline: [],
-    suspiciousSpikes: [],
-    dailyActivity: new Map(),
-    analysis: {
-      mostActiveHour: null,
-      mostActiveDay: null,
-      consistencyScore: 0,
-      activityPattern: 'Unknown'
-    }
-  };
+// Activity Analysis Functions
 
-  try {
-    // Get member information
-    const member = await guild.members.fetch(user.id);
-    behaviorData.userInfo.joinedAt = member.joinedTimestamp;
-
-    // Calculate days since joining
-    const daysSinceJoin = Math.floor((Date.now() - member.joinedTimestamp) / (1000 * 60 * 60 * 24));
-    const startDate = new Date(member.joinedTimestamp);
-
-    // Initialize daily activity tracking
-    for (let i = 0; i <= daysSinceJoin; i++) {
-      const date = new Date(startDate.getTime() + (i * 24 * 60 * 60 * 1000));
-      const dateKey = date.toISOString().split('T')[0];
-      behaviorData.dailyActivity.set(dateKey, {
-        date: dateKey,
-        messages: 0,
-        links: 0,
-        mentions: 0,
-        timestamp: date.getTime()
-      });
-    }
-
-    // Fetch messages from all accessible channels
-    const channels = guild.channels.cache.filter(channel => 
-      channel.type === 0 && // Text channels
-      channel.permissionsFor(guild.members.me).has('ReadMessageHistory')
-    );
-
-    console.log(`Analyzing ${channels.size} channels for user ${user.tag}...`);
-
-    for (const [channelId, channel] of channels) {
-      try {
-        let lastMessageId = null;
-        let channelMessageCount = 0;
-        const maxMessagesPerChannel = 500; // Limit to prevent rate limiting
-
-        while (channelMessageCount < maxMessagesPerChannel) {
-          const options = { limit: 100 };
-          if (lastMessageId) options.before = lastMessageId;
-
-          const messages = await channel.messages.fetch(options);
-          if (messages.size === 0) break;
-
-          const userMessages = messages.filter(msg => 
-            msg.author.id === user.id && 
-            msg.createdTimestamp >= member.joinedTimestamp
-          );
-
-          for (const [msgId, message] of userMessages) {
-            const messageDate = new Date(message.createdTimestamp);
-            const dateKey = messageDate.toISOString().split('T')[0];
-
-            if (behaviorData.dailyActivity.has(dateKey)) {
-              const dayData = behaviorData.dailyActivity.get(dateKey);
-              dayData.messages++;
-
-              // Count links
-              const linkPattern = /(https?:\/\/[^\s]+)/g;
-              const links = (message.content.match(linkPattern) || []).length;
-              dayData.links += links;
-              behaviorData.messageStats.totalLinks += links;
-
-              // Count mentions
-              const mentions = message.mentions.users.size + message.mentions.roles.size + message.mentions.channels.size;
-              dayData.mentions += mentions;
-              behaviorData.messageStats.totalMentions += mentions;
-
-              behaviorData.messageStats.totalMessages++;
-            }
-          }
-
-          channelMessageCount += messages.size;
-          lastMessageId = messages.last()?.id;
-
-          // Stop if we've gone past the join date
-          const oldestMessage = messages.last();
-          if (oldestMessage && oldestMessage.createdTimestamp < member.joinedTimestamp) {
-            break;
-          }
-        }
-      } catch (error) {
-        console.error(`Error fetching messages from channel ${channel.name}:`, error);
-      }
-    }
-
-    // Process daily activity data
-    const activityArray = Array.from(behaviorData.dailyActivity.values())
-      .sort((a, b) => a.timestamp - b.timestamp);
-
-    behaviorData.activityTimeline = activityArray;
-
-    // Calculate statistics
-    if (daysSinceJoin > 0) {
-      behaviorData.messageStats.averageMessagesPerDay = Math.round(
-        behaviorData.messageStats.totalMessages / daysSinceJoin
-      );
-    }
-
-    // Find peak activity day
-    let peakDay = null;
-    let peakCount = 0;
-    for (const dayData of activityArray) {
-      if (dayData.messages > peakCount) {
-        peakCount = dayData.messages;
-        peakDay = dayData.date;
-      }
-    }
-    behaviorData.messageStats.peakActivityDay = peakDay;
-    behaviorData.messageStats.peakActivityCount = peakCount;
-
-    // Detect suspicious activity spikes
-    const averageDaily = behaviorData.messageStats.averageMessagesPerDay;
-    const spikeThreshold = Math.max(10, averageDaily * 3); // 3x average or minimum 10
-
-    for (let i = 0; i < activityArray.length; i++) {
-      const dayData = activityArray[i];
-      if (dayData.messages >= spikeThreshold) {
-        // Check if it's part of a sustained spike
-        let spikeStart = i;
-        let spikeEnd = i;
-
-        // Find start of spike
-        while (spikeStart > 0 && activityArray[spikeStart - 1].messages > averageDaily * 1.5) {
-          spikeStart--;
-        }
-
-        // Find end of spike
-        while (spikeEnd < activityArray.length - 1 && activityArray[spikeEnd + 1].messages > averageDaily * 1.5) {
-          spikeEnd++;
-        }
-
-        const spikeData = {
-          startDate: activityArray[spikeStart].date,
-          endDate: activityArray[spikeEnd].date,
-          peakMessages: dayData.messages,
-          totalMessages: activityArray.slice(spikeStart, spikeEnd + 1)
-            .reduce((sum, day) => sum + day.messages, 0),
-          duration: spikeEnd - spikeStart + 1
-        };
-
-        // Avoid duplicate spikes
-        const existingSpike = behaviorData.suspiciousSpikes.find(spike => 
-          spike.startDate === spikeData.startDate
-        );
-
-        if (!existingSpike) {
-          behaviorData.suspiciousSpikes.push(spikeData);
-        }
-
-        // Skip ahead to avoid overlapping spikes
-        i = spikeEnd;
-      }
-    }
-
-    // Analyse activity patterns
-    const hourlyActivity = new Map();
-    const weeklyActivity = new Map();
-
-    // This would require more detailed timestamp analysis
-    // For now, provide basic pattern analysis
-    const nonZeroDays = activityArray.filter(day => day.messages > 0).length;
-    const consistencyScore = Math.round((nonZeroDays / Math.max(1, daysSinceJoin)) * 100);
-
-    behaviorData.analysis.consistencyScore = consistencyScore;
-
-    if (consistencyScore > 80) {
-      behaviorData.analysis.activityPattern = 'Highly Consistent';
-    } else if (consistencyScore > 60) {
-      behaviorData.analysis.activityPattern = 'Moderately Consistent';
-    } else if (consistencyScore > 30) {
-      behaviorData.analysis.activityPattern = 'Sporadic';
-    } else {
-      behaviorData.analysis.activityPattern = 'Inactive/Lurker';
-    }
-
-  } catch (error) {
-    console.error('Error analysing behaviour summary:', error);
-    throw error;
+async function getActivityData(guildId, userId, days) {
+  const dates = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    dates.push(d.toISOString().split('T')[0]);
   }
-
-  return behaviorData;
+  const records = await ActivityLogModel.find({
+    guildId, userId, date: { $in: dates }
+  }).lean();
+  const recordMap = new Map(records.map(r => [r.date, r]));
+  return dates.map(date => ({
+    date,
+    messages:       recordMap.get(date)?.messages ?? 0,
+    links:          recordMap.get(date)?.links ?? 0,
+    mentions:       recordMap.get(date)?.mentions ?? 0,
+    uniqueChannels: recordMap.get(date)?.uniqueChannels?.length ?? 0
+  }));
 }
 
-async function createBehaviorSummaryEmbeds(behaviorData, user, guild) {
-  // Generate activity graph data for complete timeline
-  const graphData = generateActivityGraph(behaviorData.activityTimeline);
+function buildDetailedGraph(activityData) {
+  const maxMsgs = Math.max(...activityData.map(d => d.messages), 1);
+  const graphHeight = 6;
+  const dayAbbr = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
+  const lines = [];
+  for (let row = graphHeight; row >= 1; row--) {
+    const threshold = (row / graphHeight) * maxMsgs;
+    const label = Math.round(threshold).toString().padStart(4);
+    const bar = activityData.map(d => (d.messages >= threshold && d.messages > 0) ? '█ ' : '  ').join('');
+    lines.push(label + '│' + bar);
+  }
+  lines.push('    └' + '──'.repeat(activityData.length));
+  const dayRow = '    ' + activityData.map(d => {
+    const dow = new Date(d.date + 'T12:00:00Z').getDay();
+    return dayAbbr[dow];
+  }).join('');
+  lines.push(dayRow);
+  return lines.join('\n');
+}
 
-  // Single comprehensive behavior summary embed
+function buildDailyTable(activityData) {
+  const maxMsgs = Math.max(...activityData.map(d => d.messages), 1);
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const header = 'Day  Date  │ Msg │ Ch │ Lk │ Mt │ Activity';
+  const sep    = '─'.repeat(45);
+  const rows = activityData.map(d => {
+    const dt = new Date(d.date + 'T12:00:00Z');
+    const dayName = dayNames[dt.getDay()];
+    const month   = String(dt.getMonth() + 1).padStart(2, '0');
+    const dayNum  = String(dt.getDate()).padStart(2, '0');
+    const msgs = d.messages.toString().padStart(3);
+    const chs  = d.uniqueChannels.toString().padStart(2);
+    const lks  = d.links.toString().padStart(2);
+    const mts  = d.mentions.toString().padStart(2);
+    const barLen = d.messages === 0 ? 0 : Math.max(1, Math.round((d.messages / maxMsgs) * 8));
+    const bar  = '█'.repeat(barLen);
+    return dayName + ' ' + month + '/' + dayNum + ' │ ' + msgs + ' │ ' + chs + ' │ ' + lks + ' │ ' + mts + ' │ ' + bar;
+  });
+  return [header, sep, ...rows].join('\n');
+}
+
+function buildActivityEmbed(user, days, activityData) {
+  const totalMessages = activityData.reduce((s, d) => s + d.messages, 0);
+  const totalLinks    = activityData.reduce((s, d) => s + d.links, 0);
+  const totalMentions = activityData.reduce((s, d) => s + d.mentions, 0);
+  const activeDays    = activityData.filter(d => d.messages > 0).length;
+  const avgPerDay     = days > 0 ? Math.round(totalMessages / days) : 0;
+  const peakDay       = activityData.reduce((best, d) => d.messages > best.messages ? d : best, activityData[0]);
+  const consistencyScore = Math.round((activeDays / days) * 100);
+
+  const half       = Math.floor(activityData.length / 2);
+  const firstHalf  = activityData.slice(0, half).reduce((s, d) => s + d.messages, 0);
+  const secondHalf = activityData.slice(half).reduce((s, d) => s + d.messages, 0);
+  let trend = 'Stable —';
+  if (totalMessages > 0) {
+    if (secondHalf > firstHalf * 1.25)      trend = 'Increasing ↑';
+    else if (secondHalf < firstHalf * 0.75) trend = 'Decreasing ↓';
+  }
+
+  const periodLabel = days === 14 ? '2 Weeks' : days + ' Days';
+  const peakStr     = totalMessages > 0 ? peakDay.date + ' (' + peakDay.messages + ' msgs)' : 'No activity';
+
+  const fields = [
+    { name: 'Total Messages', value: totalMessages.toString(), inline: true },
+    { name: 'Avg / Day',      value: avgPerDay.toString(),     inline: true },
+    { name: 'Active Days',    value: activeDays + ' / ' + days, inline: true },
+    { name: 'Peak Day',       value: peakStr,    inline: true },
+    { name: 'Trend',          value: trend,      inline: true },
+    { name: 'Consistency',    value: consistencyScore + '%',  inline: true }
+  ];
+
+  if (totalMessages > 0) {
+    const graph = buildDetailedGraph(activityData);
+    const table = buildDailyTable(activityData);
+    fields.push({ name: 'Activity Graph',  value: '```\n' + graph + '\n```', inline: false });
+    fields.push({ name: 'Daily Breakdown', value: '```\n' + table + '\n```', inline: false });
+  }
+
+  const description = totalMessages === 0
+    ? 'No activity recorded in this server over the last **' + periodLabel + '**.\n> Tracking started from when Izumi was deployed.'
+    : 'Server activity for the last **' + periodLabel + '**';
+
   const embed = new EmbedBuilder()
-    .setTitle(`Behaviour Analysis: ${user.tag}`)
-    .setDescription(`Complete activity analysis since joining this server`)
-    .setThumbnail(user.displayAvatarURL({ dynamic: true, size: 256 }))
+    .setTitle('Activity Report: ' + user.username)
+    .setDescription(description)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
     .setColor(0x5865F2)
+    .addFields(fields)
+    .setFooter({ text: 'Links shared: ' + totalLinks + ' · Mentions sent: ' + totalMentions + ' · Data tracked from bot deployment' })
     .setTimestamp();
 
-  // User info section
-  const joinDate = behaviorData.userInfo.joinedAt ? 
-    `<t:${Math.floor(behaviorData.userInfo.joinedAt / 1000)}:D>` : 'Unknown';
-  const daysSinceJoin = behaviorData.userInfo.joinedAt ? 
-    Math.floor((Date.now() - behaviorData.userInfo.joinedAt) / (1000 * 60 * 60 * 24)) : 0;
-
-  embed.addFields(
-    { name: 'Joined Server', value: joinDate, inline: true },
-    { name: 'Days Since Join', value: `${daysSinceJoin} days`, inline: true },
-    { name: 'Activity Pattern', value: behaviorData.analysis.activityPattern, inline: true }
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('bsum_3_'  + user.id).setLabel('3 Days' ).setStyle(days ===  3 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('bsum_5_'  + user.id).setLabel('5 Days' ).setStyle(days ===  5 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('bsum_10_' + user.id).setLabel('10 Days').setStyle(days === 10 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('bsum_14_' + user.id).setLabel('2 Weeks').setStyle(days === 14 ? ButtonStyle.Primary : ButtonStyle.Secondary)
   );
 
-  // Message statistics
-  embed.addFields(
-    { name: 'Total Messages', value: behaviorData.messageStats.totalMessages.toString(), inline: true },
-    { name: 'Links Shared', value: behaviorData.messageStats.totalLinks.toString(), inline: true },
-    { name: 'Total Mentions', value: behaviorData.messageStats.totalMentions.toString(), inline: true }
-  );
-
-  // Activity metrics
-  embed.addFields(
-    { name: 'Avg Messages/Day', value: behaviorData.messageStats.averageMessagesPerDay.toString(), inline: true },
-    { name: 'Peak Activity Day', value: `${behaviorData.messageStats.peakActivityCount} messages`, inline: true },
-    { name: 'Consistency Score', value: `${behaviorData.analysis.consistencyScore}%`, inline: true }
-  );
-
-  // Complete activity timeline graph
-  if (graphData.length > 0) {
-    const timelineTitle = daysSinceJoin <= 30 ? 
-      `Activity Timeline (${daysSinceJoin} days)` : 
-      `Activity Timeline (${daysSinceJoin} days - Showing pattern)`;
-
-    embed.addFields({
-      name: ` ${timelineTitle}`,
-      value: `\`\`\`\n${graphData}\n\`\`\``,
-      inline: false
-    });
-  }
-
-  // Suspicious activity spikes (if any)
-  if (behaviorData.suspiciousSpikes.length > 0) {
-    const spikesText = behaviorData.suspiciousSpikes.slice(0, 3).map(spike => {
-      const duration = spike.duration === 1 ? '1 day' : `${spike.duration} days`;
-      return `${spike.startDate} to ${spike.endDate}: ${spike.totalMessages} messages over ${duration}`;
-    }).join('\n');
-
-    embed.addFields({
-      name: `Suspicious Activity Spikes`,
-      value: spikesText,
-      inline: false
-    });
-  }
-
-  return [embed];
+  return { embed, components: [buttons] };
 }
 
-function generateActivityGraph(timeline) {
-  if (timeline.length === 0) return 'No activity data available';
-
-  let dataToGraph = timeline;
-
-  // If timeline is very long, sample it to fit in Discord embed
-  if (timeline.length > 60) {
-    // Sample every nth day to fit approximately 60 points
-    const step = Math.ceil(timeline.length / 60);
-    dataToGraph = timeline.filter((_, index) => index % step === 0);
-  }
-
-  if (dataToGraph.length === 0) return 'No activity data available';
-
-  const maxMessages = Math.max(...dataToGraph.map(day => day.messages));
-  if (maxMessages === 0) return 'No messages found in timeline';
-
-  // Create a simple text-based graph
-  const graphLines = [];
-  const graphHeight = 8; // Number of rows in graph
-
-  // Create graph rows from top to bottom
-  for (let row = graphHeight; row >= 0; row--) {
-    let line = '';
-    const threshold = (row / graphHeight) * maxMessages;
-
-    for (const day of dataToGraph) {
-      if (day.messages >= threshold && day.messages > 0) {
-        line += '█';
-      } else if (day.messages >= threshold * 0.7 && day.messages > 0) {
-        line += '▓';
-      } else if (day.messages >= threshold * 0.3 && day.messages > 0) {
-        line += '▒';
-      } else if (day.messages > 0) {
-        line += '░';
-      } else {
-        line += ' ';
-      }
-    }
-
-    // Add y-axis label
-    const label = Math.round(threshold).toString().padStart(3, ' ');
-    graphLines.push(`${label}│${line}`);
-  }
-
-  // Add x-axis
-  const xAxis = '   └' + '─'.repeat(dataToGraph.length);
-  graphLines.push(xAxis);
-
-  // Add date labels for start and end
-  if (dataToGraph.length >= 2) {
-    const firstDate = dataToGraph[0].date.split('-').slice(1).join('/');
-    const lastDate = dataToGraph[dataToGraph.length - 1].date.split('-').slice(1).join('/');
-    const spacing = ' '.repeat(Math.max(0, dataToGraph.length - firstDate.length - lastDate.length));
-    graphLines.push(`    ${firstDate}${spacing}${lastDate}`);
-  }
-
-  // Add summary line
-  const totalDays = timeline.length;
-  const totalMessages = timeline.reduce((sum, day) => sum + day.messages, 0);
-  graphLines.push(`    Total: ${totalMessages} messages over ${totalDays} days`);
-
-  return graphLines.join('\n');
-}
 
 client.login(process.env.TOKEN);
+
+获取 Outlook for iOS
