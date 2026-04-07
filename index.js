@@ -585,7 +585,7 @@ async function quarantineUser(member, reason, moderator = null) {
   // DM the user
   try {
     const dmEmbed = new EmbedBuilder()
-      .setTitle('⚠️ You Have Been Quarantined')
+      .setTitle('You Have Been Quarantined')
       .setDescription(`You have been placed into quarantine in **${guild.name}**.\n\nYou can only access the **#quarantine-room** channel until a moderator reviews and clears your account.`)
       .addFields(
         { name: 'Reason', value: reason || 'No reason provided', inline: false },
@@ -598,16 +598,16 @@ async function quarantineUser(member, reason, moderator = null) {
 
   // Post a detailed report in the quarantine-room
   const reportEmbed = new EmbedBuilder()
-    .setTitle('🔒 User Quarantined')
+    .setTitle('User Quarantined')
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
     .setDescription(`${member} has been placed under quarantine and can no longer access any other channels in this server.`)
     .addFields(
-      { name: '👤 User', value: `${member.user.tag}\n\`${member.user.id}\``, inline: true },
-      { name: '📅 Account Age', value: `${accountAgeDays} day${accountAgeDays !== 1 ? 's' : ''}`, inline: true },
-      { name: '📥 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
-      { name: '📋 Reason', value: reason || 'No reason provided', inline: false },
-      { name: '🛡️ Actioned By', value: moderator ? `${moderator.tag}` : 'Izumi (Automatic)', inline: true },
-      { name: '🕐 Quarantined At', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+      { name: 'User', value: `${member.user.tag}\n\`${member.user.id}\``, inline: true },
+      { name: 'Account Age', value: `${accountAgeDays} day${accountAgeDays !== 1 ? 's' : ''}`, inline: true },
+      { name: 'Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
+      { name: 'Reason', value: reason || 'No reason provided', inline: false },
+      { name: 'Actioned By', value: moderator ? `${moderator.tag}` : 'Izumi (Automatic)', inline: true },
+      { name: 'Quarantined At', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
     )
     .setColor(0xFF6B6B)
     .setFooter({ text: 'Use /allow <user> to release them from quarantine.' })
@@ -1081,12 +1081,12 @@ client.on('interactionCreate', async interaction => {
 
       // This is a placeholder - in a real implementation you'd store check history in a database
       const embed = new EmbedBuilder()
-        .setTitle(' Recent Alt Account Checks')
+        .setTitle('Recent Alt Account Checks')
         .setDescription('This feature requires a database to store check history. Currently showing placeholder data.')
         .addFields(
-          { name: '⏰ Last 24 Hours', value: 'No checks recorded', inline: false },
-          { name: ' Total Checks', value: 'Database not configured', inline: true },
-          { name: ' High Risk Found', value: 'Database not configured', inline: true }
+          { name: 'Last 24 Hours', value: 'No checks recorded', inline: false },
+          { name: 'Total Checks', value: 'Database not configured', inline: true },
+          { name: 'High Risk Found', value: 'Database not configured', inline: true }
         )
         .setColor(0xFFA500)
         .setTimestamp();
@@ -1266,22 +1266,22 @@ client.on('interactionCreate', async interaction => {
 
       if (!result.success) {
         return interaction.editReply({
-          content: `❌ Failed to quarantine user: ${result.error}`
+          content: `Failed to quarantine user: ${result.error}`
         });
       }
 
       const accountAgeDays = Math.floor((Date.now() - target.createdTimestamp) / (1000 * 60 * 60 * 24));
       const embed = new EmbedBuilder()
-        .setTitle('🔒 User Quarantined')
+        .setTitle('User Quarantined')
         .setDescription(`**${target.tag}** has been quarantined and can no longer access any server channels.`)
         .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
         .addFields(
-          { name: '👤 User', value: `${target.tag}\n\`${target.id}\``, inline: true },
-          { name: '📅 Account Age', value: `${accountAgeDays} day${accountAgeDays !== 1 ? 's' : ''}`, inline: true },
-          { name: '📥 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
-          { name: '📋 Reason', value: `Manually quarantined by ${interaction.user.tag}`, inline: false },
-          { name: '🚪 Quarantine Channel', value: `${result.quarantineChannel}`, inline: true },
-          { name: '🕐 Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+          { name: 'User', value: `${target.tag}\n\`${target.id}\``, inline: true },
+          { name: 'Account Age', value: `${accountAgeDays} day${accountAgeDays !== 1 ? 's' : ''}`, inline: true },
+          { name: 'Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
+          { name: 'Reason', value: `Manually quarantined by ${interaction.user.tag}`, inline: false },
+          { name: 'Quarantine Channel', value: `${result.quarantineChannel}`, inline: true },
+          { name: 'Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
         )
         .setColor(0xFF6B6B)
         .setFooter({ text: 'Use /allow to release this user from quarantine.' })
@@ -1323,7 +1323,7 @@ client.on('interactionCreate', async interaction => {
         // DM the released user
         try {
           const dmEmbed = new EmbedBuilder()
-            .setTitle('✅ Quarantine Lifted')
+            .setTitle('Quarantine Lifted')
             .setDescription(`Your quarantine in **${interaction.guild.name}** has been lifted by a moderator. You can now access the server normally.`)
             .setColor(0x57F287)
             .setTimestamp();
@@ -1334,13 +1334,13 @@ client.on('interactionCreate', async interaction => {
         const quarantineChannel = interaction.guild.channels.cache.find(c => c.name === 'quarantine-room');
         if (quarantineChannel) {
           const releaseEmbed = new EmbedBuilder()
-            .setTitle('✅ User Released from Quarantine')
+            .setTitle('User Released from Quarantine')
             .setDescription(`${member} has been cleared by a moderator and can now access the server.`)
             .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
             .addFields(
-              { name: '👤 User', value: `${target.tag}\n\`${target.id}\``, inline: true },
-              { name: '🛡️ Released By', value: `${interaction.user.tag}`, inline: true },
-              { name: '🕐 Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+              { name: 'User', value: `${target.tag}\n\`${target.id}\``, inline: true },
+              { name: 'Released By', value: `${interaction.user.tag}`, inline: true },
+              { name: 'Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
             )
             .setColor(0x57F287)
             .setTimestamp();
@@ -1348,13 +1348,13 @@ client.on('interactionCreate', async interaction => {
         }
 
         const successEmbed = new EmbedBuilder()
-          .setTitle('✅ User Released from Quarantine')
+          .setTitle('User Released from Quarantine')
           .setDescription(`**${target.tag}** has been released from quarantine and can now access the server normally.`)
           .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
           .addFields(
-            { name: '👤 User', value: `${target.tag}\n\`${target.id}\``, inline: true },
-            { name: '🛡️ Released By', value: `${interaction.user.tag}`, inline: true },
-            { name: '🕐 Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+            { name: 'User', value: `${target.tag}\n\`${target.id}\``, inline: true },
+            { name: 'Released By', value: `${interaction.user.tag}`, inline: true },
+            { name: 'Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
           )
           .setColor(0x57F287)
           .setTimestamp();
@@ -1362,7 +1362,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply({ embeds: [successEmbed] });
       } catch (e) {
         console.error('Error removing quarantine role:', e);
-        return interaction.editReply({ content: `❌ Failed to release user from quarantine: ${e.message}` });
+        return interaction.editReply({ content: `Failed to release user from quarantine: ${e.message}` });
       }
     }
 
