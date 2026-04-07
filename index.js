@@ -503,54 +503,126 @@ async function loadAllConfigs() {
 
 // ---- End advanced config helpers ----
 
-async function quarantineUser(member, reason) {
+async function quarantineUser(member, reason, moderator = null) {
   const guild = member.guild;
+
+  // Check bot permissions upfront
+  const botMember = guild.members.cache.get(client.user.id);
+  if (!botMember) return { success: false, error: 'Could not resolve my own member object.' };
+  if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    return { success: false, error: 'I am missing the **Manage Roles** permission.' };
+  }
+  if (!botMember.permissions.has(PermissionFlagsBits.ManageChannels)) {
+    return { success: false, error: 'I am missing the **Manage Channels** permission.' };
+  }
+
+  // Find or create the Quarantined role
   let quarantineRole = guild.roles.cache.find(r => r.name === 'Quarantined');
   if (!quarantineRole) {
     try {
       quarantineRole = await guild.roles.create({
         name: 'Quarantined',
-        reason: 'Quarantine system setup'
+        color: 0xFF6B6B,
+        hoist: false,
+        mentionable: false,
+        reason: 'Izumi quarantine system setup'
       });
     } catch (e) {
       console.error('Error creating quarantine role:', e);
-      return;
+      return { success: false, error: 'Failed to create the Quarantined role. Check my role hierarchy.' };
     }
   }
 
-  let quarantineChannel = guild.channels.cache.find(c => c.name === 'quarantine-room');
+  // Find or create the quarantine-room channel
+  let quarantineChannel = guild.channels.cache.find(
+    c => c.name === 'quarantine-room' && c.type === ChannelType.GuildText
+  );
   if (!quarantineChannel) {
     try {
       quarantineChannel = await guild.channels.create({
         name: 'quarantine-room',
         type: ChannelType.GuildText,
+        topic: 'Quarantine holding area — monitored by Izumi.',
         permissionOverwrites: [
-          {
-            id: guild.id,
-            deny: [PermissionFlagsBits.ViewChannel]
-          },
+          { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
           {
             id: quarantineRole.id,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
+            deny: [PermissionFlagsBits.AddReactions, PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.CreatePrivateThreads, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles]
           },
           {
             id: client.user.id,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks]
           }
         ]
       });
     } catch (e) {
       console.error('Error creating quarantine channel:', e);
-      return;
+      return { success: false, error: 'Failed to create the quarantine-room channel. Check my permissions.' };
     }
   }
 
-  try {
-    await member.roles.add(quarantineRole);
-    await quarantineChannel.send(` ${member} has been quarantined.\n**Reason:** ${reason}\nAn admin or moderator will review your account shortly.`);
-  } catch (e) {
-    console.error('Error adding role or sending message:', e);
+  // Deny ViewChannel for the Quarantined role on every other channel so they cannot see the rest of the server
+  const allChannels = guild.channels.cache.filter(c => c.id !== quarantineChannel.id);
+  for (const [, channel] of allChannels) {
+    try {
+      await channel.permissionOverwrites.edit(quarantineRole.id, { ViewChannel: false });
+    } catch (e) {
+      console.warn(`Could not set quarantine permission on #${channel.name}: ${e.message}`);
+    }
   }
+
+  // Assign the quarantine role
+  try {
+    await member.roles.add(quarantineRole, `Quarantined: ${reason}`);
+  } catch (e) {
+    console.error('Error adding quarantine role:', e);
+    return { success: false, error: 'Failed to assign the Quarantined role. Check my role hierarchy.' };
+  }
+
+  const accountAgeDays = Math.floor((Date.now() - member.user.createdTimestamp) / (1000 * 60 * 60 * 24));
+
+  // DM the user
+  try {
+    const dmEmbed = new EmbedBuilder()
+      .setTitle('⚠️ You Have Been Quarantined')
+      .setDescription(`You have been placed into quarantine in **${guild.name}**.\n\nYou can only access the **#quarantine-room** channel until a moderator reviews and clears your account.`)
+      .addFields(
+        { name: 'Reason', value: reason || 'No reason provided', inline: false },
+        { name: 'What to do', value: 'Please wait in the quarantine channel. A moderator will review your account shortly.', inline: false }
+      )
+      .setColor(0xFF6B6B)
+      .setTimestamp();
+    await member.send({ embeds: [dmEmbed] });
+  } catch (e) { /* DMs may be closed — ignore */ }
+
+  // Post a detailed report in the quarantine-room
+  const reportEmbed = new EmbedBuilder()
+    .setTitle('🔒 User Quarantined')
+    .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+    .setDescription(`${member} has been placed under quarantine and can no longer access any other channels in this server.`)
+    .addFields(
+      { name: '👤 User', value: `${member.user.tag}\n\`${member.user.id}\``, inline: true },
+      { name: '📅 Account Age', value: `${accountAgeDays} day${accountAgeDays !== 1 ? 's' : ''}`, inline: true },
+      { name: '📥 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
+      { name: '📋 Reason', value: reason || 'No reason provided', inline: false },
+      { name: '🛡️ Actioned By', value: moderator ? `${moderator.tag}` : 'Izumi (Automatic)', inline: true },
+      { name: '🕐 Quarantined At', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+    )
+    .setColor(0xFF6B6B)
+    .setFooter({ text: 'Use /allow <user> to release them from quarantine.' })
+    .setTimestamp();
+
+  try {
+    await quarantineChannel.send({
+      content: `${member} — You have been quarantined. Please remain here and wait for a moderator to review your account.`,
+      embeds: [reportEmbed]
+    });
+  } catch (e) {
+    console.error('Error sending quarantine channel message:', e);
+  }
+
+  return { success: true, quarantineChannel };
 }
 
 // Helper function to create channel selection menu
@@ -1186,12 +1258,36 @@ client.on('interactionCreate', async interaction => {
 
       const quarantineRole = interaction.guild.roles.cache.find(r => r.name === 'Quarantined');
       if (quarantineRole && member.roles.cache.has(quarantineRole.id)) {
-        return interaction.reply({ content: ` **${target.tag}** is already quarantined.`, ephemeral: true });
+        return interaction.reply({ content: `**${target.tag}** is already quarantined.`, ephemeral: true });
       }
 
       await interaction.deferReply();
-      await quarantineUser(member, `Manually quarantined by ${interaction.user.tag}`);
-      return interaction.editReply({ content: ` **${target.tag}** has been moved to quarantine.` });
+      const result = await quarantineUser(member, `Manually quarantined by ${interaction.user.tag}`, interaction.user);
+
+      if (!result.success) {
+        return interaction.editReply({
+          content: `❌ Failed to quarantine user: ${result.error}`
+        });
+      }
+
+      const accountAgeDays = Math.floor((Date.now() - target.createdTimestamp) / (1000 * 60 * 60 * 24));
+      const embed = new EmbedBuilder()
+        .setTitle('🔒 User Quarantined')
+        .setDescription(`**${target.tag}** has been quarantined and can no longer access any server channels.`)
+        .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
+        .addFields(
+          { name: '👤 User', value: `${target.tag}\n\`${target.id}\``, inline: true },
+          { name: '📅 Account Age', value: `${accountAgeDays} day${accountAgeDays !== 1 ? 's' : ''}`, inline: true },
+          { name: '📥 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
+          { name: '📋 Reason', value: `Manually quarantined by ${interaction.user.tag}`, inline: false },
+          { name: '🚪 Quarantine Channel', value: `${result.quarantineChannel}`, inline: true },
+          { name: '🕐 Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+        )
+        .setColor(0xFF6B6B)
+        .setFooter({ text: 'Use /allow to release this user from quarantine.' })
+        .setTimestamp();
+
+      return interaction.editReply({ embeds: [embed] });
     }
 
     if (commandName === 'allow') {
@@ -1213,15 +1309,60 @@ client.on('interactionCreate', async interaction => {
 
       await interaction.deferReply();
       try {
-        await member.roles.remove(quarantineRole);
+        // Remove the Quarantined role
+        await member.roles.remove(quarantineRole, `Released from quarantine by ${interaction.user.tag}`);
+
+        // Clean up per-channel ViewChannel deny overrides for the Quarantined role
+        for (const [, channel] of interaction.guild.channels.cache) {
+          try {
+            const overwrite = channel.permissionOverwrites.cache.get(quarantineRole.id);
+            if (overwrite) await channel.permissionOverwrites.delete(quarantineRole.id);
+          } catch (e) { /* ignore channels we can't edit */ }
+        }
+
+        // DM the released user
+        try {
+          const dmEmbed = new EmbedBuilder()
+            .setTitle('✅ Quarantine Lifted')
+            .setDescription(`Your quarantine in **${interaction.guild.name}** has been lifted by a moderator. You can now access the server normally.`)
+            .setColor(0x57F287)
+            .setTimestamp();
+          await member.send({ embeds: [dmEmbed] });
+        } catch (e) { /* DMs may be closed */ }
+
+        // Post in quarantine-room
         const quarantineChannel = interaction.guild.channels.cache.find(c => c.name === 'quarantine-room');
         if (quarantineChannel) {
-          await quarantineChannel.send(` ${member} has been cleared from quarantine by a moderator and can now access the server.`).catch(() => {});
+          const releaseEmbed = new EmbedBuilder()
+            .setTitle('✅ User Released from Quarantine')
+            .setDescription(`${member} has been cleared by a moderator and can now access the server.`)
+            .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
+            .addFields(
+              { name: '👤 User', value: `${target.tag}\n\`${target.id}\``, inline: true },
+              { name: '🛡️ Released By', value: `${interaction.user.tag}`, inline: true },
+              { name: '🕐 Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+            )
+            .setColor(0x57F287)
+            .setTimestamp();
+          await quarantineChannel.send({ embeds: [releaseEmbed] }).catch(() => {});
         }
-        return interaction.editReply({ content: ` **${target.tag}** has been released from quarantine.` });
+
+        const successEmbed = new EmbedBuilder()
+          .setTitle('✅ User Released from Quarantine')
+          .setDescription(`**${target.tag}** has been released from quarantine and can now access the server normally.`)
+          .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
+          .addFields(
+            { name: '👤 User', value: `${target.tag}\n\`${target.id}\``, inline: true },
+            { name: '🛡️ Released By', value: `${interaction.user.tag}`, inline: true },
+            { name: '🕐 Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+          )
+          .setColor(0x57F287)
+          .setTimestamp();
+
+        return interaction.editReply({ embeds: [successEmbed] });
       } catch (e) {
         console.error('Error removing quarantine role:', e);
-        return interaction.editReply({ content: 'Failed to remove quarantine role. Check my permissions.' });
+        return interaction.editReply({ content: `❌ Failed to release user from quarantine: ${e.message}` });
       }
     }
 
@@ -1855,7 +1996,10 @@ client.on('guildMemberAdd', async member => {
   }
 
   if (shouldQuarantine) {
-    await quarantineUser(member, reason);
+    const result = await quarantineUser(member, reason);
+    if (result && !result.success) {
+      console.error(`Auto-quarantine failed for ${member.user.tag}: ${result.error}`);
+    }
   }
 });
 
