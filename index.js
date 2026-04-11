@@ -48,6 +48,17 @@ const ActivityLogSchema = new mongoose.Schema({
 ActivityLogSchema.index({ guildId: 1, userId: 1, date: 1 }, { unique: true });
 const ActivityLogModel = mongoose.model('IzumiActivityLog', ActivityLogSchema);
 
+const QuarantinedUserSchema = new mongoose.Schema({
+  guildId: { type: String, required: true },
+  userId: { type: String, required: true },
+  savedRoles: { type: [String], default: [] },
+  reason: { type: String, default: '' },
+  quarantinedBy: { type: String, default: 'Automatic' },
+  quarantinedAt: { type: Date, default: Date.now }
+});
+QuarantinedUserSchema.index({ guildId: 1, userId: 1 }, { unique: true });
+const QuarantinedUserModel = mongoose.model('IzumiQuarantinedUser', QuarantinedUserSchema);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -510,13 +521,13 @@ async function quarantineUser(member, reason, moderator = null) {
   const botMember = guild.members.cache.get(client.user.id);
   if (!botMember) return { success: false, error: 'Could not resolve my own member object.' };
   if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
-    return { success: false, error: 'I am missing the **Manage Roles** permission.' };
+    return { success: false, error: 'I am missing the Manage Roles permission.' };
   }
   if (!botMember.permissions.has(PermissionFlagsBits.ManageChannels)) {
-    return { success: false, error: 'I am missing the **Manage Channels** permission.' };
+    return { success: false, error: 'I am missing the Manage Channels permission.' };
   }
 
-  // Find or create the Quarantined role
+  // Find or create the Quarantined role (no base permissions)
   let quarantineRole = guild.roles.cache.find(r => r.name === 'Quarantined');
   if (!quarantineRole) {
     try {
@@ -525,6 +536,7 @@ async function quarantineUser(member, reason, moderator = null) {
         color: 0xFF6B6B,
         hoist: false,
         mentionable: false,
+        permissions: [],
         reason: 'Izumi quarantine system setup'
       });
     } catch (e) {
@@ -533,7 +545,7 @@ async function quarantineUser(member, reason, moderator = null) {
     }
   }
 
-  // Find or create the quarantine-room channel
+  // Find or create the quarantine-room, and always ensure its overrides are correct
   let quarantineChannel = guild.channels.cache.find(
     c => c.name === 'quarantine-room' && c.type === ChannelType.GuildText
   );
@@ -560,19 +572,64 @@ async function quarantineUser(member, reason, moderator = null) {
       console.error('Error creating quarantine channel:', e);
       return { success: false, error: 'Failed to create the quarantine-room channel. Check my permissions.' };
     }
-  }
-
-  // Deny ViewChannel for the Quarantined role on every other channel so they cannot see the rest of the server
-  const allChannels = guild.channels.cache.filter(c => c.id !== quarantineChannel.id);
-  for (const [, channel] of allChannels) {
+  } else {
+    // Channel already exists — patch its overrides to make sure they are correct
     try {
-      await channel.permissionOverwrites.edit(quarantineRole.id, { ViewChannel: false });
+      await quarantineChannel.permissionOverwrites.edit(guild.id, { ViewChannel: false });
+      await quarantineChannel.permissionOverwrites.edit(quarantineRole.id, {
+        ViewChannel: true, SendMessages: true, ReadMessageHistory: true,
+        AddReactions: false, CreatePublicThreads: false, CreatePrivateThreads: false,
+        EmbedLinks: false, AttachFiles: false
+      });
+      await quarantineChannel.permissionOverwrites.edit(client.user.id, {
+        ViewChannel: true, SendMessages: true, ManageMessages: true,
+        ReadMessageHistory: true, EmbedLinks: true
+      });
     } catch (e) {
-      console.warn(`Could not set quarantine permission on #${channel.name}: ${e.message}`);
+      console.warn('Could not patch quarantine-room overrides:', e.message);
     }
   }
 
-  // Assign the quarantine role
+  // Save all of the user's current roles to MongoDB so they can be fully restored on /allow
+  const savedRoleIds = member.roles.cache
+    .filter(r => r.id !== guild.id) // exclude @everyone (not a real assignable role)
+    .map(r => r.id);
+
+  await QuarantinedUserModel.findOneAndUpdate(
+    { guildId: guild.id, userId: member.id },
+    {
+      guildId: guild.id, userId: member.id,
+      savedRoles: savedRoleIds,
+      reason: reason || '',
+      quarantinedBy: moderator?.tag || 'Automatic',
+      quarantinedAt: new Date()
+    },
+    { upsert: true, new: true }
+  ).catch(e => console.error('Failed to save quarantine record:', e));
+
+  // Remove all manageable roles from the user so no other role can grant them ViewChannel
+  const roleIdsToRemove = savedRoleIds.filter(id => {
+    const role = guild.roles.cache.get(id);
+    return role && botMember.roles.highest.comparePositionTo(role) > 0;
+  });
+  if (roleIdsToRemove.length > 0) {
+    await member.roles.remove(roleIdsToRemove, 'Quarantine: stripping roles').catch(
+      e => console.warn('Could not strip some roles during quarantine:', e.message)
+    );
+  }
+
+  // Set ViewChannel: false for the Quarantined role on every channel except quarantine-room
+  // Combined with role removal above this is a double lock — neither approach alone is foolproof
+  for (const [, channel] of guild.channels.cache) {
+    if (channel.id === quarantineChannel.id) continue;
+    try {
+      await channel.permissionOverwrites.edit(quarantineRole.id, { ViewChannel: false });
+    } catch (e) {
+      console.warn(`Could not deny ViewChannel on #${channel.name}: ${e.message}`);
+    }
+  }
+
+  // Assign the Quarantined role
   try {
     await member.roles.add(quarantineRole, `Quarantined: ${reason}`);
   } catch (e) {
@@ -594,7 +651,7 @@ async function quarantineUser(member, reason, moderator = null) {
       .setColor(0xFF6B6B)
       .setTimestamp();
     await member.send({ embeds: [dmEmbed] });
-  } catch (e) { /* DMs may be closed — ignore */ }
+  } catch (e) { /* DMs may be closed */ }
 
   // Post a detailed report in the quarantine-room
   const reportEmbed = new EmbedBuilder()
@@ -1311,6 +1368,23 @@ client.on('interactionCreate', async interaction => {
       try {
         // Remove the Quarantined role
         await member.roles.remove(quarantineRole, `Released from quarantine by ${interaction.user.tag}`);
+
+        // Restore the user's saved roles from MongoDB
+        const botMember = interaction.guild.members.cache.get(client.user.id);
+        const record = await QuarantinedUserModel.findOne({ guildId: interaction.guild.id, userId: member.id });
+        if (record && record.savedRoles.length > 0) {
+          const rolesToRestore = record.savedRoles.filter(id => {
+            const role = interaction.guild.roles.cache.get(id);
+            return role && role.id !== quarantineRole.id &&
+                   botMember && botMember.roles.highest.comparePositionTo(role) > 0;
+          });
+          if (rolesToRestore.length > 0) {
+            await member.roles.add(rolesToRestore, `Quarantine released: restoring roles`).catch(
+              e => console.warn('Could not restore some roles:', e.message)
+            );
+          }
+          await QuarantinedUserModel.deleteOne({ guildId: interaction.guild.id, userId: member.id });
+        }
 
         // Clean up per-channel ViewChannel deny overrides for the Quarantined role
         for (const [, channel] of interaction.guild.channels.cache) {
