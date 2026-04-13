@@ -52,6 +52,7 @@ const QuarantinedUserSchema = new mongoose.Schema({
   guildId: { type: String, required: true },
   userId: { type: String, required: true },
   savedRoles: { type: [String], default: [] },
+  quarantineChannelId: { type: String, default: null },
   reason: { type: String, default: '' },
   quarantinedBy: { type: String, default: 'Automatic' },
   quarantinedAt: { type: Date, default: Date.now }
@@ -545,54 +546,78 @@ async function quarantineUser(member, reason, moderator = null) {
     }
   }
 
-  // Find or create the quarantine-room, and always ensure its overrides are correct
-  let quarantineChannel = guild.channels.cache.find(
-    c => c.name === 'quarantine-room' && c.type === ChannelType.GuildText
-  );
-  if (!quarantineChannel) {
+  // Build a safe channel name from the username
+  const safeName = ('quarantine-' + member.user.username.toLowerCase()
+    .replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 20))
+    || ('quarantine-' + member.user.id);
+
+  // Find mod roles so they can see the private quarantine channel
+  const modRoleOverwrites = guild.roles.cache
+    .filter(r =>
+      r.id !== guild.id &&
+      r.id !== quarantineRole.id &&
+      (r.permissions.has(PermissionFlagsBits.ModerateMembers) ||
+       r.permissions.has(PermissionFlagsBits.BanMembers) ||
+       r.permissions.has(PermissionFlagsBits.ManageGuild))
+    )
+    .map(r => ({
+      id: r.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
+    }));
+
+  // The permission set for the private channel:
+  // - @everyone: denied
+  // - Quarantined role: denied (so other quarantined users cannot see this channel)
+  // - The specific user: explicitly allowed (user-specific overrides are highest priority in Discord)
+  // - Bot: allowed with management permissions
+  // - Any mod roles: allowed
+  const channelOverwrites = [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: quarantineRole.id, deny: [PermissionFlagsBits.ViewChannel] },
+    {
+      id: member.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
+      deny: [PermissionFlagsBits.AddReactions, PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.CreatePrivateThreads, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles]
+    },
+    {
+      id: client.user.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks]
+    },
+    ...modRoleOverwrites
+  ];
+
+  // Find an existing quarantine channel for this user (by stored ID or by name fallback)
+  let quarantineChannel = null;
+  const existingRecord = await QuarantinedUserModel.findOne({ guildId: guild.id, userId: member.id });
+  if (existingRecord?.quarantineChannelId) {
+    quarantineChannel = guild.channels.cache.get(existingRecord.quarantineChannelId) || null;
+  }
+
+  if (quarantineChannel) {
+    // Reuse and patch the existing channel's overrides
+    try {
+      await quarantineChannel.permissionOverwrites.set(channelOverwrites);
+    } catch (e) {
+      console.warn('Could not patch existing quarantine channel overrides:', e.message);
+    }
+  } else {
+    // Create a fresh private channel for this user
     try {
       quarantineChannel = await guild.channels.create({
-        name: 'quarantine-room',
+        name: safeName,
         type: ChannelType.GuildText,
-        topic: 'Quarantine holding area — monitored by Izumi.',
-        permissionOverwrites: [
-          { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-          {
-            id: quarantineRole.id,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
-            deny: [PermissionFlagsBits.AddReactions, PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.CreatePrivateThreads, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles]
-          },
-          {
-            id: client.user.id,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks]
-          }
-        ]
+        topic: `Private quarantine channel for ${member.user.tag}.`,
+        permissionOverwrites: channelOverwrites
       });
     } catch (e) {
       console.error('Error creating quarantine channel:', e);
-      return { success: false, error: 'Failed to create the quarantine-room channel. Check my permissions.' };
-    }
-  } else {
-    // Channel already exists — patch its overrides to make sure they are correct
-    try {
-      await quarantineChannel.permissionOverwrites.edit(guild.id, { ViewChannel: false });
-      await quarantineChannel.permissionOverwrites.edit(quarantineRole.id, {
-        ViewChannel: true, SendMessages: true, ReadMessageHistory: true,
-        AddReactions: false, CreatePublicThreads: false, CreatePrivateThreads: false,
-        EmbedLinks: false, AttachFiles: false
-      });
-      await quarantineChannel.permissionOverwrites.edit(client.user.id, {
-        ViewChannel: true, SendMessages: true, ManageMessages: true,
-        ReadMessageHistory: true, EmbedLinks: true
-      });
-    } catch (e) {
-      console.warn('Could not patch quarantine-room overrides:', e.message);
+      return { success: false, error: 'Failed to create the quarantine channel. Check my permissions.' };
     }
   }
 
-  // Save all of the user's current roles to MongoDB so they can be fully restored on /allow
+  // Save the user's current roles and the quarantine channel ID to MongoDB
   const savedRoleIds = member.roles.cache
-    .filter(r => r.id !== guild.id) // exclude @everyone (not a real assignable role)
+    .filter(r => r.id !== guild.id)
     .map(r => r.id);
 
   await QuarantinedUserModel.findOneAndUpdate(
@@ -600,6 +625,7 @@ async function quarantineUser(member, reason, moderator = null) {
     {
       guildId: guild.id, userId: member.id,
       savedRoles: savedRoleIds,
+      quarantineChannelId: quarantineChannel.id,
       reason: reason || '',
       quarantinedBy: moderator?.tag || 'Automatic',
       quarantinedAt: new Date()
@@ -607,7 +633,7 @@ async function quarantineUser(member, reason, moderator = null) {
     { upsert: true, new: true }
   ).catch(e => console.error('Failed to save quarantine record:', e));
 
-  // Remove all manageable roles from the user so no other role can grant them ViewChannel
+  // Strip all manageable roles from the user (double-lock alongside the channel denies)
   const roleIdsToRemove = savedRoleIds.filter(id => {
     const role = guild.roles.cache.get(id);
     return role && botMember.roles.highest.comparePositionTo(role) > 0;
@@ -618,8 +644,7 @@ async function quarantineUser(member, reason, moderator = null) {
     );
   }
 
-  // Set ViewChannel: false for the Quarantined role on every channel except quarantine-room
-  // Combined with role removal above this is a double lock — neither approach alone is foolproof
+  // Deny ViewChannel for the Quarantined role on every channel except the user's private channel
   for (const [, channel] of guild.channels.cache) {
     if (channel.id === quarantineChannel.id) continue;
     try {
@@ -643,21 +668,21 @@ async function quarantineUser(member, reason, moderator = null) {
   try {
     const dmEmbed = new EmbedBuilder()
       .setTitle('You Have Been Quarantined')
-      .setDescription(`You have been placed into quarantine in **${guild.name}**.\n\nYou can only access the **#quarantine-room** channel until a moderator reviews and clears your account.`)
+      .setDescription(`You have been placed into quarantine in **${guild.name}**.\n\nYou have access to your own private quarantine channel. Only you and the moderation team can see it.`)
       .addFields(
         { name: 'Reason', value: reason || 'No reason provided', inline: false },
-        { name: 'What to do', value: 'Please wait in the quarantine channel. A moderator will review your account shortly.', inline: false }
+        { name: 'What to do', value: 'Please wait in your quarantine channel. A moderator will review your account shortly.', inline: false }
       )
       .setColor(0xFF6B6B)
       .setTimestamp();
     await member.send({ embeds: [dmEmbed] });
   } catch (e) { /* DMs may be closed */ }
 
-  // Post a detailed report in the quarantine-room
+  // Post a report inside the private quarantine channel
   const reportEmbed = new EmbedBuilder()
     .setTitle('User Quarantined')
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
-    .setDescription(`${member} has been placed under quarantine and can no longer access any other channels in this server.`)
+    .setDescription(`${member} — this is your private quarantine channel. Only you and the moderation team can see this. Please wait for a moderator to review your account.`)
     .addFields(
       { name: 'User', value: `${member.user.tag}\n\`${member.user.id}\``, inline: true },
       { name: 'Account Age', value: `${accountAgeDays} day${accountAgeDays !== 1 ? 's' : ''}`, inline: true },
@@ -667,14 +692,11 @@ async function quarantineUser(member, reason, moderator = null) {
       { name: 'Quarantined At', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
     )
     .setColor(0xFF6B6B)
-    .setFooter({ text: 'Use /allow <user> to release them from quarantine.' })
+    .setFooter({ text: 'Use /allow to release this user from quarantine.' })
     .setTimestamp();
 
   try {
-    await quarantineChannel.send({
-      content: `${member} — You have been quarantined. Please remain here and wait for a moderator to review your account.`,
-      embeds: [reportEmbed]
-    });
+    await quarantineChannel.send({ content: `${member}`, embeds: [reportEmbed] });
   } catch (e) {
     console.error('Error sending quarantine channel message:', e);
   }
@@ -1366,12 +1388,13 @@ client.on('interactionCreate', async interaction => {
 
       await interaction.deferReply();
       try {
+        const botMember = interaction.guild.members.cache.get(client.user.id);
+        const record = await QuarantinedUserModel.findOne({ guildId: interaction.guild.id, userId: member.id });
+
         // Remove the Quarantined role
         await member.roles.remove(quarantineRole, `Released from quarantine by ${interaction.user.tag}`);
 
         // Restore the user's saved roles from MongoDB
-        const botMember = interaction.guild.members.cache.get(client.user.id);
-        const record = await QuarantinedUserModel.findOne({ guildId: interaction.guild.id, userId: member.id });
         if (record && record.savedRoles.length > 0) {
           const rolesToRestore = record.savedRoles.filter(id => {
             const role = interaction.guild.roles.cache.get(id);
@@ -1379,20 +1402,49 @@ client.on('interactionCreate', async interaction => {
                    botMember && botMember.roles.highest.comparePositionTo(role) > 0;
           });
           if (rolesToRestore.length > 0) {
-            await member.roles.add(rolesToRestore, `Quarantine released: restoring roles`).catch(
+            await member.roles.add(rolesToRestore, 'Quarantine released: restoring roles').catch(
               e => console.warn('Could not restore some roles:', e.message)
             );
           }
-          await QuarantinedUserModel.deleteOne({ guildId: interaction.guild.id, userId: member.id });
         }
 
-        // Clean up per-channel ViewChannel deny overrides for the Quarantined role
+        // Post release notice inside the private quarantine channel, then delete it
+        const quarantineChannelId = record?.quarantineChannelId;
+        const quarantineChannel = quarantineChannelId
+          ? interaction.guild.channels.cache.get(quarantineChannelId)
+          : null;
+
+        if (quarantineChannel) {
+          const releaseEmbed = new EmbedBuilder()
+            .setTitle('User Released from Quarantine')
+            .setDescription(`${member} has been cleared by **${interaction.user.tag}** and can now access the server normally. This channel will be deleted.`)
+            .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
+            .addFields(
+              { name: 'User', value: `${target.tag}\n\`${target.id}\``, inline: true },
+              { name: 'Released By', value: `${interaction.user.tag}`, inline: true },
+              { name: 'Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+            )
+            .setColor(0x57F287)
+            .setTimestamp();
+          await quarantineChannel.send({ embeds: [releaseEmbed] }).catch(() => {});
+          // Wait briefly so the release message is visible before the channel is deleted
+          await new Promise(r => setTimeout(r, 3000));
+          await quarantineChannel.delete(`Quarantine released for ${target.tag}`).catch(
+            e => console.warn('Could not delete quarantine channel:', e.message)
+          );
+        }
+
+        // Clean up per-channel ViewChannel deny overrides for the Quarantined role on all channels
         for (const [, channel] of interaction.guild.channels.cache) {
           try {
             const overwrite = channel.permissionOverwrites.cache.get(quarantineRole.id);
             if (overwrite) await channel.permissionOverwrites.delete(quarantineRole.id);
           } catch (e) { /* ignore channels we can't edit */ }
         }
+
+        // Delete the quarantine record
+        await QuarantinedUserModel.deleteOne({ guildId: interaction.guild.id, userId: member.id })
+          .catch(e => console.warn('Could not delete quarantine record:', e.message));
 
         // DM the released user
         try {
@@ -1404,26 +1456,9 @@ client.on('interactionCreate', async interaction => {
           await member.send({ embeds: [dmEmbed] });
         } catch (e) { /* DMs may be closed */ }
 
-        // Post in quarantine-room
-        const quarantineChannel = interaction.guild.channels.cache.find(c => c.name === 'quarantine-room');
-        if (quarantineChannel) {
-          const releaseEmbed = new EmbedBuilder()
-            .setTitle('User Released from Quarantine')
-            .setDescription(`${member} has been cleared by a moderator and can now access the server.`)
-            .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
-            .addFields(
-              { name: 'User', value: `${target.tag}\n\`${target.id}\``, inline: true },
-              { name: 'Released By', value: `${interaction.user.tag}`, inline: true },
-              { name: 'Time', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
-            )
-            .setColor(0x57F287)
-            .setTimestamp();
-          await quarantineChannel.send({ embeds: [releaseEmbed] }).catch(() => {});
-        }
-
         const successEmbed = new EmbedBuilder()
           .setTitle('User Released from Quarantine')
-          .setDescription(`**${target.tag}** has been released from quarantine and can now access the server normally.`)
+          .setDescription(`**${target.tag}** has been released from quarantine and can now access the server normally. Their private quarantine channel has been deleted.`)
           .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
           .addFields(
             { name: 'User', value: `${target.tag}\n\`${target.id}\``, inline: true },
@@ -1435,7 +1470,7 @@ client.on('interactionCreate', async interaction => {
 
         return interaction.editReply({ embeds: [successEmbed] });
       } catch (e) {
-        console.error('Error removing quarantine role:', e);
+        console.error('Error releasing from quarantine:', e);
         return interaction.editReply({ content: `Failed to release user from quarantine: ${e.message}` });
       }
     }
