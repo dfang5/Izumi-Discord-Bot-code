@@ -56,15 +56,13 @@ function buildControlPanelEmbed(ticketChannel, creatorId, locked) {
       `The designated support staff will attend to you shortly.\n\n` +
       `**You may close this ticket at any time using the button below.**`
     )
-    .addFields(
-      {
-        name: 'Status',
-        value: locked
-          ? 'Locked — message input is currently disabled for this channel.'
-          : 'Open — this session is active and accepting messages.',
-        inline: false
-      }
-    )
+    .addFields({
+      name: 'Status',
+      value: locked
+        ? 'Locked — message input is currently disabled for this channel.'
+        : 'Open — this session is active and accepting messages.',
+      inline: false
+    })
     .setColor(locked ? 0xFF6B6B : 0x57F287)
     .setFooter({ text: `Ticket channel: ${ticketChannel.name} — ID: ${ticketChannel.id}` })
     .setTimestamp();
@@ -117,10 +115,11 @@ async function refreshControlPanel(ticketChannel, creatorId, locked, oldMessageI
 
 async function handleSetTicketCommand(interaction) {
   if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-    return interaction.reply({
+    await interaction.reply({
       content: 'You need the **Manage Server** permission to configure the ticket system.',
-      ephemeral: true
+      ephemeral: false
     });
+    return;
   }
 
   const embed = new EmbedBuilder()
@@ -139,10 +138,10 @@ async function handleSetTicketCommand(interaction) {
     .setMinValues(1)
     .setMaxValues(1);
 
-  return interaction.reply({
+  await interaction.reply({
     embeds: [embed],
     components: [new ActionRowBuilder().addComponents(channelSelect)],
-    ephemeral: true
+    ephemeral: false
   });
 }
 
@@ -153,7 +152,7 @@ async function handleTicketInteraction(interaction) {
   const { customId } = interaction;
   if (!customId) return false;
 
-  // Step 1: Channel selected
+  // Step 1: Channel selected during setup
   if (interaction.isChannelSelectMenu() && customId.startsWith('ticket_setup_chan_')) {
     const guildId = customId.replace('ticket_setup_chan_', '');
     const selectedChannelId = interaction.values[0];
@@ -167,9 +166,7 @@ async function handleTicketInteraction(interaction) {
       .setCustomId('caption')
       .setLabel('Caption (shown above the Create Ticket button)')
       .setStyle(TextInputStyle.Paragraph)
-      .setPlaceholder(
-        'e.g. Need assistance? Open a ticket and our team will respond promptly.'
-      )
+      .setPlaceholder('e.g. Need assistance? Open a ticket and our team will respond promptly.')
       .setRequired(true)
       .setMaxLength(500);
 
@@ -201,55 +198,74 @@ async function handleTicketInteraction(interaction) {
       .setMinValues(1)
       .setMaxValues(25);
 
-    return interaction.reply({
+    await interaction.reply({
       embeds: [embed],
       components: [new ActionRowBuilder().addComponents(roleSelect)],
-      ephemeral: true
+      ephemeral: false
     });
+    return true;
   }
 
-  // Step 3: Support roles selected — finalize
+  // Step 3: Support roles selected — finalize setup
   if (interaction.isRoleSelectMenu() && customId.startsWith('ticket_setup_roles_')) {
     const guildId = customId.replace('ticket_setup_roles_', '');
     const state = setupState.get(guildId);
 
     if (!state || !state.channelId) {
-      return interaction.reply({
+      await interaction.reply({
         content: 'Setup session expired. Please run `/setticket` again.',
-        ephemeral: true
+        ephemeral: false
       });
+      return true;
     }
 
     const { channelId, caption } = state;
     const allowedRoles = interaction.values;
 
-    const existingConfig = await TicketConfigModel.findOne({ guildId });
-
-    if (existingConfig?.panelMessageId) {
-      const oldChan = interaction.guild.channels.cache.get(existingConfig.channelId);
-      if (oldChan) {
-        await oldChan.messages
-          .fetch(existingConfig.panelMessageId)
-          .then(m => m.delete())
-          .catch(() => {});
+    // Try to delete a previous panel message if reconfiguring
+    try {
+      const existingConfig = await TicketConfigModel.findOne({ guildId });
+      if (existingConfig?.panelMessageId) {
+        const oldChan = interaction.guild.channels.cache.get(existingConfig.channelId);
+        if (oldChan) {
+          await oldChan.messages
+            .fetch(existingConfig.panelMessageId)
+            .then(m => m.delete())
+            .catch(() => {});
+        }
       }
-    }
+    } catch (_) {}
 
     const targetChannel = interaction.guild.channels.cache.get(channelId);
     if (!targetChannel) {
-      return interaction.reply({ content: 'The selected channel no longer exists.', ephemeral: true });
+      await interaction.reply({
+        content: 'The selected channel no longer exists. Please run `/setticket` again and pick a valid channel.',
+        ephemeral: false
+      });
+      return true;
     }
 
-    const panelEmbed = buildTicketPanelEmbed(caption);
-    const createRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`ticket_create_${guildId}`)
-        .setLabel('Create Ticket')
-        .setStyle(ButtonStyle.Primary)
-    );
+    // Send the panel to the chosen channel
+    let panelMsg;
+    try {
+      const panelEmbed = buildTicketPanelEmbed(caption);
+      const createRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ticket_create_${guildId}`)
+          .setLabel('Create Ticket')
+          .setStyle(ButtonStyle.Primary)
+      );
+      panelMsg = await targetChannel.send({ embeds: [panelEmbed], components: [createRow] });
+    } catch (e) {
+      console.error('Ticket panel send error:', e);
+      await interaction.reply({
+        content: `Failed to post the ticket panel in <#${channelId}>. Please make sure I have permission to send messages and embeds in that channel.`,
+        ephemeral: false
+      });
+      return true;
+    }
 
-    const panelMsg = await targetChannel.send({ embeds: [panelEmbed], components: [createRow] });
-
+    // Save config
     await TicketConfigModel.findOneAndUpdate(
       { guildId },
       { guildId, channelId, caption, allowedRoles, panelMessageId: panelMsg.id },
@@ -269,7 +285,8 @@ async function handleTicketInteraction(interaction) {
       .setColor(0x57F287)
       .setTimestamp();
 
-    return interaction.reply({ embeds: [confirmEmbed], ephemeral: true });
+    await interaction.reply({ embeds: [confirmEmbed], ephemeral: false });
+    return true;
   }
 
   // Create ticket button
@@ -278,16 +295,18 @@ async function handleTicketInteraction(interaction) {
     const config = await TicketConfigModel.findOne({ guildId });
 
     if (!config) {
-      return interaction.reply({
+      await interaction.reply({
         content: 'The ticket system is not properly configured for this server.',
-        ephemeral: true
+        ephemeral: false
       });
+      return true;
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ ephemeral: false });
 
     const guild = interaction.guild;
     const creator = interaction.member;
+    const botId = guild.members.me ? guild.members.me.id : interaction.client.user.id;
 
     const safeName =
       'ticket-' +
@@ -311,7 +330,7 @@ async function handleTicketInteraction(interaction) {
         ]
       },
       {
-        id: guild.members.me.id,
+        id: botId,
         allow: [
           PermissionFlagsBits.ViewChannel,
           PermissionFlagsBits.SendMessages,
@@ -346,9 +365,10 @@ async function handleTicketInteraction(interaction) {
       });
     } catch (e) {
       console.error('Error creating ticket channel:', e);
-      return interaction.editReply({
-        content: 'Failed to create the ticket channel. Please ensure I have the Manage Channels permission.'
+      await interaction.editReply({
+        content: 'Failed to create the ticket channel. Please ensure I have the **Manage Channels** permission.'
       });
+      return true;
     }
 
     const roleMentions = config.allowedRoles.map(r => `<@&${r}>`).join(', ');
@@ -358,8 +378,8 @@ async function handleTicketInteraction(interaction) {
       .setDescription(
         `${creator} — your ticket has been received.\n\n` +
         (roleMentions
-          ? `${roleMentions} — a member of the team will be with you shortly. Please describe your matter in the meantime and someone will respond as soon as possible.`
-          : 'A member of the team will be with you shortly. Please describe your matter and someone will respond as soon as possible.')
+          ? `${roleMentions} — a member of the team will be with you shortly. Please describe your matter in the meantime.`
+          : 'A member of the team will be with you shortly. Please describe your matter.')
       )
       .setColor(0x5865F2)
       .setTimestamp();
@@ -381,7 +401,8 @@ async function handleTicketInteraction(interaction) {
       locked: false
     });
 
-    return interaction.editReply({ content: `Your ticket has been created: ${ticketChannel}` });
+    await interaction.editReply({ content: `Your ticket has been created: ${ticketChannel}` });
+    return true;
   }
 
   // Lock button
@@ -389,12 +410,14 @@ async function handleTicketInteraction(interaction) {
     const channelId = customId.replace('ticket_lock_', '');
     const ticket = await ActiveTicketModel.findOne({ channelId });
     if (!ticket) {
-      return interaction.reply({ content: 'This ticket record no longer exists.', ephemeral: true });
+      await interaction.reply({ content: 'This ticket record no longer exists.', ephemeral: false });
+      return true;
     }
 
     const ticketChannel = interaction.guild.channels.cache.get(channelId);
     if (!ticketChannel) {
-      return interaction.reply({ content: 'Ticket channel not found.', ephemeral: true });
+      await interaction.reply({ content: 'Ticket channel not found.', ephemeral: false });
+      return true;
     }
 
     await ticketChannel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false });
@@ -409,12 +432,14 @@ async function handleTicketInteraction(interaction) {
     const channelId = customId.replace('ticket_unlock_', '');
     const ticket = await ActiveTicketModel.findOne({ channelId });
     if (!ticket) {
-      return interaction.reply({ content: 'This ticket record no longer exists.', ephemeral: true });
+      await interaction.reply({ content: 'This ticket record no longer exists.', ephemeral: false });
+      return true;
     }
 
     const ticketChannel = interaction.guild.channels.cache.get(channelId);
     if (!ticketChannel) {
-      return interaction.reply({ content: 'Ticket channel not found.', ephemeral: true });
+      await interaction.reply({ content: 'Ticket channel not found.', ephemeral: false });
+      return true;
     }
 
     await ticketChannel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: null });
@@ -430,7 +455,7 @@ async function handleTicketInteraction(interaction) {
 
     await interaction.reply({
       content: 'Closing this ticket. The channel will be deleted momentarily.',
-      ephemeral: true
+      ephemeral: false
     });
 
     const ticketChannel = interaction.guild.channels.cache.get(channelId);
@@ -442,13 +467,14 @@ async function handleTicketInteraction(interaction) {
     return true;
   }
 
-  // Configure button — update roles for a live ticket
+  // Configure button — change roles for a live ticket
   if (interaction.isButton() && customId.startsWith('ticket_configure_')) {
     if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.reply({
+      await interaction.reply({
         content: 'You need the **Manage Server** permission to reconfigure ticket roles.',
-        ephemeral: true
+        ephemeral: false
       });
+      return true;
     }
 
     const channelId = customId.replace('ticket_configure_', '');
@@ -457,7 +483,7 @@ async function handleTicketInteraction(interaction) {
       .setTitle('Reconfigure Ticket Access')
       .setDescription(
         'Select the roles that should have access to this ticket channel.\n\n' +
-        'The ticket creator will always retain access. Leave the selection empty to remove all role access.'
+        'The ticket creator will always retain access regardless of what is selected here.'
       )
       .setColor(0x5865F2);
 
@@ -467,28 +493,31 @@ async function handleTicketInteraction(interaction) {
       .setMinValues(0)
       .setMaxValues(25);
 
-    return interaction.reply({
+    await interaction.reply({
       embeds: [embed],
       components: [new ActionRowBuilder().addComponents(roleSelect)],
-      ephemeral: true
+      ephemeral: false
     });
+    return true;
   }
 
-  // Configure role select — apply updated roles to the live ticket channel
+  // Configure role select — apply updated roles to a live ticket channel
   if (interaction.isRoleSelectMenu() && customId.startsWith('ticket_cfg_roles_')) {
     const channelId = customId.replace('ticket_cfg_roles_', '');
     const ticket = await ActiveTicketModel.findOne({ channelId });
     if (!ticket) {
-      return interaction.reply({ content: 'Ticket not found in database.', ephemeral: true });
+      await interaction.reply({ content: 'Ticket not found in database.', ephemeral: false });
+      return true;
     }
 
     const ticketChannel = interaction.guild.channels.cache.get(channelId);
     if (!ticketChannel) {
-      return interaction.reply({ content: 'Ticket channel not found.', ephemeral: true });
+      await interaction.reply({ content: 'Ticket channel not found.', ephemeral: false });
+      return true;
     }
 
     const selectedRoles = interaction.values;
-    const botId = interaction.guild.members.me.id;
+    const botId = interaction.guild.members.me ? interaction.guild.members.me.id : interaction.client.user.id;
 
     for (const [id] of ticketChannel.permissionOverwrites.cache) {
       const isEveryone = id === interaction.guild.id;
@@ -513,10 +542,11 @@ async function handleTicketInteraction(interaction) {
       ? selectedRoles.map(r => `<@&${r}>`).join(', ')
       : 'None — only the ticket creator can see this channel now.';
 
-    return interaction.reply({
+    await interaction.reply({
       content: `Ticket access updated. Roles with access: ${rolesMentions}`,
-      ephemeral: true
+      ephemeral: false
     });
+    return true;
   }
 
   return false;
@@ -539,7 +569,7 @@ async function handleTicketMessageCreate(message) {
     ticket.creatorId,
     ticket.locked,
     ticket.controlPanelMessageId
-  );
+  ).catch(() => {});
 }
 
 async function loadTicketConfigs() {
