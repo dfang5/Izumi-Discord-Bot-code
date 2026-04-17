@@ -1,6 +1,12 @@
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ChannelType, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, RoleSelectMenuBuilder, UserSelectMenuBuilder, ChannelSelectMenuBuilder } = require('discord.js');
 const { calculateRisk } = require('./risks');
 const { makeCheckEmbed } = require('./embeds');
+const {
+  handleSetTicketCommand,
+  handleTicketInteraction,
+  handleTicketMessageCreate,
+  loadTicketConfigs
+} = require('./ticket');
 const mongoose = require('mongoose');
 require('dotenv').config();
 
@@ -206,7 +212,12 @@ const commands = [
       subcommand
         .setName('toggle')
         .setDescription('Configure per-channel content restrictions, role jurisdiction, and user exemptions'))
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('setticket')
+    .setDescription('Set up the ticket system for this server')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
 ];
 
 // Helper functions for permissions
@@ -804,6 +815,7 @@ client.once('ready', async () => {
 
   await connectDB();
   await loadAllConfigs();
+  await loadTicketConfigs();
 
   // Register slash commands
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
@@ -838,6 +850,9 @@ client.on('messageCreate', async message => {
     // Advanced content restriction enforcement
     const handled = await checkAdvancedRestrictions(message);
     if (handled) return;
+
+    // Ticket control panel — keep it pinned to the bottom of ticket channels
+    await handleTicketMessageCreate(message);
   }
 
   // Status auto-reply when the bot owner is mentioned
@@ -985,6 +1000,9 @@ client.on('messageCreate', async message => {
 //  Slash command handler
 client.on('interactionCreate', async interaction => {
   try {
+    const ticketHandled = await handleTicketInteraction(interaction);
+    if (ticketHandled) return;
+
     if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
 
@@ -1505,6 +1523,10 @@ client.on('interactionCreate', async interaction => {
           components: [new ActionRowBuilder().addComponents(channelSelect)]
         });
       }
+    }
+
+    if (commandName === 'setticket') {
+      return handleSetTicketCommand(interaction);
     }
 
     if (commandName === 'configure') {
