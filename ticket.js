@@ -9,7 +9,8 @@ const {
   TextInputBuilder,
   TextInputStyle,
   PermissionFlagsBits,
-  ChannelType
+  ChannelType,
+  AttachmentBuilder
 } = require('discord.js');
 const mongoose = require('mongoose');
 
@@ -20,7 +21,8 @@ const TicketConfigSchema = new mongoose.Schema({
   channelId: { type: String, required: true },
   panelMessageId: { type: String, default: null },
   caption: { type: String, default: 'Open a ticket and our team will assist you.' },
-  allowedRoles: { type: [String], default: [] }
+  allowedRoles: { type: [String], default: [] },
+  transcriptChannelId: { type: String, default: null }
 });
 const TicketConfigModel = mongoose.model('IzumiTicketConfig', TicketConfigSchema);
 
@@ -29,14 +31,23 @@ const ActiveTicketSchema = new mongoose.Schema({
   channelId: { type: String, required: true, unique: true },
   creatorId: { type: String, required: true },
   locked: { type: Boolean, default: false },
+  closed: { type: Boolean, default: false },
+  transcriptSaved: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
 const ActiveTicketModel = mongoose.model('IzumiActiveTicket', ActiveTicketSchema);
 
-// Temporary multi-step setup state: guildId -> { channelId, caption }
-const setupState = new Map();
+// DB-backed setup state so it survives bot restarts/redeployments
+const TicketSetupStateSchema = new mongoose.Schema({
+  guildId: { type: String, required: true, unique: true },
+  channelId: { type: String, default: null },
+  caption: { type: String, default: null },
+  allowedRoles: { type: [String], default: [] },
+  updatedAt: { type: Date, default: Date.now }
+});
+const TicketSetupStateModel = mongoose.model('IzumiTicketSetupState', TicketSetupStateSchema);
 
-// ---- Embed builders ----
+// ---- Helpers ----
 
 function buildTicketPanelEmbed(caption) {
   return new EmbedBuilder()
@@ -47,25 +58,114 @@ function buildTicketPanelEmbed(caption) {
     .setTimestamp();
 }
 
+async function fetchAllMessages(channel) {
+  const messages = [];
+  let lastId = null;
+  for (let i = 0; i < 10; i++) {
+    const options = { limit: 100 };
+    if (lastId) options.before = lastId;
+    let batch;
+    try {
+      batch = await channel.messages.fetch(options);
+    } catch {
+      break;
+    }
+    if (!batch || batch.size === 0) break;
+    messages.push(...batch.values());
+    lastId = batch.last().id;
+    if (batch.size < 100) break;
+  }
+  return messages.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+}
+
+function formatTranscript(channel, ticket, messages) {
+  const pad = n => String(n).padStart(2, '0');
+  const fmt = d => {
+    if (!d || !(d instanceof Date) || isNaN(d)) return 'Unknown';
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
+  };
+
+  const now = new Date();
+  const openedAt = ticket.createdAt instanceof Date ? ticket.createdAt : new Date(ticket.createdAt);
+
+  const header = [
+    '='.repeat(60),
+    'TICKET TRANSCRIPT',
+    `Channel  : #${channel.name} (${channel.id})`,
+    `Opened by: ${ticket.creatorId}`,
+    `Opened at: ${fmt(openedAt)}`,
+    `Exported : ${fmt(now)}`,
+    `Messages : ${messages.length}`,
+    '='.repeat(60),
+    ''
+  ].join('\n');
+
+  const body = messages.map(m => {
+    const ts = fmt(new Date(m.createdTimestamp));
+    const tag = m.author ? m.author.username : 'Unknown';
+    let text = m.content || '';
+    if (m.attachments.size > 0) {
+      text += (text ? '\n' : '') + [...m.attachments.values()].map(a => `[Attachment: ${a.url}]`).join('\n');
+    }
+    if (m.embeds.length > 0 && !text) text = '[Embed]';
+    return `[${ts}] ${tag}: ${text || '[no text content]'}`;
+  }).join('\n');
+
+  return header + body;
+}
+
+async function postTranscript(guild, channel, ticket, closedById) {
+  const config = await TicketConfigModel.findOne({ guildId: ticket.guildId });
+  const transcriptChannelId = config?.transcriptChannelId;
+
+  const messages = await fetchAllMessages(channel);
+  const text = formatTranscript(channel, ticket, messages);
+  const buffer = Buffer.from(text, 'utf-8');
+  const filename = `transcript-${channel.name}-${Date.now()}.txt`;
+  const attachment = new AttachmentBuilder(buffer, { name: filename });
+
+  const openedAt = ticket.createdAt instanceof Date ? ticket.createdAt : new Date(ticket.createdAt);
+  const tsUnix = Math.floor((isNaN(openedAt) ? Date.now() : openedAt.getTime()) / 1000);
+
+  const embed = new EmbedBuilder()
+    .setTitle('Ticket Transcript Saved')
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'Channel', value: `#${channel.name}`, inline: true },
+      { name: 'Opened by', value: `<@${ticket.creatorId}>`, inline: true },
+      { name: 'Closed by', value: closedById ? `<@${closedById}>` : 'Unknown', inline: true },
+      { name: 'Messages', value: String(messages.length), inline: true },
+      { name: 'Opened', value: `<t:${tsUnix}:f>`, inline: true }
+    )
+    .setTimestamp();
+
+  if (transcriptChannelId) {
+    const transcriptChan = guild.channels.cache.get(transcriptChannelId);
+    if (transcriptChan) {
+      await transcriptChan.send({ embeds: [embed], files: [attachment] });
+      return transcriptChan;
+    }
+  }
+
+  return null;
+}
+
 // ---- Slash command handler (/setticket) ----
 
 async function handleSetTicketCommand(interaction) {
   if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-    await interaction.reply({
-      content: 'You need the **Manage Server** permission to configure the ticket system.',
-      ephemeral: false
-    });
+    await interaction.reply({ content: 'You need the **Manage Server** permission to configure the ticket system.', ephemeral: false });
     return;
   }
 
   const embed = new EmbedBuilder()
-    .setTitle('Ticket System Setup — Step 1 of 3')
+    .setTitle('Ticket System Setup — Step 1 of 4')
     .setDescription(
       'Select the channel where the ticket creation panel will be posted.\n\n' +
       'Members will see an embed and a button in that channel to open a new private ticket with your team.'
     )
     .setColor(0x5865F2)
-    .setFooter({ text: 'Step 1 of 3 — Select a channel' });
+    .setFooter({ text: 'Step 1 of 4 — Select a channel' });
 
   const channelSelect = new ChannelSelectMenuBuilder()
     .setCustomId(`ticket_setup_chan_${interaction.guild.id}`)
@@ -91,23 +191,133 @@ async function handleTicketCommand(interaction) {
   const ticket = await ActiveTicketModel.findOne({ channelId, guildId });
 
   if (!ticket) {
-    await interaction.reply({
-      content: 'This command can only be used inside an active ticket channel.',
-      ephemeral: false
-    });
+    await interaction.reply({ content: 'This command can only be used inside an active ticket channel.', ephemeral: false });
     return;
   }
 
   const isStaff = interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
-  const isCreator = interaction.user.id === ticket.creatorId;
 
+  // /ticket close — soft close: lock only the creator out, keep channel for staff
   if (subcommand === 'close') {
-    await interaction.reply({ content: 'Closing ticket. This channel will be deleted momentarily.' });
-    await ActiveTicketModel.deleteOne({ channelId }).catch(() => {});
-    await interaction.channel.delete('Ticket closed').catch(() => {});
+    if (ticket.closed) {
+      await interaction.reply({ content: 'This ticket is already closed.', ephemeral: false });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      // Only revoke SendMessages from the ticket creator — staff roles are untouched
+      await interaction.channel.permissionOverwrites.edit(ticket.creatorId, {
+        ViewChannel: true,
+        SendMessages: false,
+        ReadMessageHistory: true
+      });
+    } catch (e) {
+      console.error('Error editing permissions on close:', e);
+    }
+
+    await ActiveTicketModel.findOneAndUpdate({ channelId }, { closed: true });
+
+    const closeEmbed = new EmbedBuilder()
+      .setTitle('Ticket Closed')
+      .setDescription(
+        `This ticket was closed by ${interaction.user}.\n\n` +
+        `The member can no longer send messages here. Staff may still view and respond.\n\n` +
+        `Use **Save Transcript & Delete** to archive this conversation, or **Reopen** to restore member access.`
+      )
+      .setColor(0xED4245)
+      .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`ticket_reopen_${channelId}`)
+        .setLabel('Reopen')
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji('🔓'),
+      new ButtonBuilder()
+        .setCustomId(`ticket_transcript_delete_${channelId}`)
+        .setLabel('Save Transcript & Delete')
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji('📋')
+    );
+
+    await interaction.editReply({ embeds: [closeEmbed], components: [row] });
     return;
   }
 
+  // /ticket transcript — save transcript to log channel then delete
+  if (subcommand === 'transcript') {
+    if (!isStaff) {
+      await interaction.reply({ content: 'You need the **Manage Server** permission to save transcripts.', ephemeral: false });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      const transcriptChan = await postTranscript(interaction.guild, interaction.channel, ticket, interaction.user.id);
+      await ActiveTicketModel.findOneAndUpdate({ channelId }, { transcriptSaved: true });
+
+      if (transcriptChan) {
+        await interaction.editReply({ content: `Transcript saved to ${transcriptChan}. Deleting channel in 5 seconds…` });
+      } else {
+        await interaction.editReply({ content: `Transcript saved (tip: configure a transcript log channel via \`/setticket\` to log these automatically). Deleting channel in 5 seconds…` });
+      }
+
+      await new Promise(r => setTimeout(r, 5000));
+      await ActiveTicketModel.deleteOne({ channelId }).catch(() => {});
+      await interaction.channel.delete('Transcript saved and ticket deleted').catch(() => {});
+    } catch (e) {
+      console.error('Transcript error:', e);
+      await interaction.editReply({ content: `Failed to save transcript: ${e.message}` }).catch(() => {});
+    }
+    return;
+  }
+
+  // /ticket delete — hard delete, warn if no transcript saved
+  if (subcommand === 'delete') {
+    if (!isStaff) {
+      await interaction.reply({ content: 'You need the **Manage Server** permission to delete tickets.', ephemeral: false });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      if (!ticket.transcriptSaved) {
+        const config = await TicketConfigModel.findOne({ guildId });
+        const transcriptChannelId = config?.transcriptChannelId;
+        if (transcriptChannelId) {
+          const transcriptChan = interaction.guild.channels.cache.get(transcriptChannelId);
+          if (transcriptChan) {
+            const warnEmbed = new EmbedBuilder()
+              .setTitle('⚠️ Ticket Deleted Without Transcript')
+              .setDescription(
+                `A ticket was deleted without saving a transcript.\n\n` +
+                `**Channel:** #${interaction.channel.name}\n` +
+                `**Opened by:** <@${ticket.creatorId}>\n` +
+                `**Deleted by:** ${interaction.user}\n\n` +
+                `Deleting tickets without saving a transcript is against transparency policy.`
+              )
+              .setColor(0xFEE75C)
+              .setTimestamp();
+            await transcriptChan.send({ embeds: [warnEmbed] }).catch(() => {});
+          }
+        }
+      }
+
+      await interaction.editReply({ content: 'Deleting ticket channel…' });
+      await ActiveTicketModel.deleteOne({ channelId }).catch(() => {});
+      await interaction.channel.delete('Ticket forcefully deleted').catch(() => {});
+    } catch (e) {
+      console.error('Delete error:', e);
+      await interaction.editReply({ content: `Failed to delete ticket: ${e.message}` }).catch(() => {});
+    }
+    return;
+  }
+
+  // /ticket lock
   if (subcommand === 'lock') {
     if (!isStaff) {
       await interaction.reply({ content: 'You need the **Manage Server** permission to lock tickets.', ephemeral: false });
@@ -119,17 +329,19 @@ async function handleTicketCommand(interaction) {
     return;
   }
 
+  // /ticket unlock
   if (subcommand === 'unlock') {
     if (!isStaff) {
       await interaction.reply({ content: 'You need the **Manage Server** permission to unlock tickets.', ephemeral: false });
       return;
     }
     await interaction.channel.permissionOverwrites.edit(guildId, { SendMessages: null });
-    await ActiveTicketModel.findOneAndUpdate({ channelId }, { locked: false });
+    await ActiveTicketModel.findOneAndUpdate({ channelId }, { locked: false, closed: false });
     await interaction.reply({ content: 'Ticket unlocked. Members can now send messages again.' });
     return;
   }
 
+  // /ticket roles
   if (subcommand === 'roles') {
     if (!isStaff) {
       await interaction.reply({ content: 'You need the **Manage Server** permission to reconfigure ticket roles.', ephemeral: false });
@@ -160,7 +372,6 @@ async function handleTicketCommand(interaction) {
 }
 
 // ---- Main interaction router ----
-// Returns true if the interaction was handled, false otherwise.
 
 async function handleTicketInteraction(interaction) {
   const { customId } = interaction;
@@ -170,11 +381,16 @@ async function handleTicketInteraction(interaction) {
   if (interaction.isChannelSelectMenu() && customId.startsWith('ticket_setup_chan_')) {
     const guildId = customId.replace('ticket_setup_chan_', '');
     const selectedChannelId = interaction.values[0];
-    setupState.set(guildId, { channelId: selectedChannelId });
+
+    await TicketSetupStateModel.findOneAndUpdate(
+      { guildId },
+      { guildId, channelId: selectedChannelId, updatedAt: new Date() },
+      { upsert: true, new: true }
+    );
 
     const modal = new ModalBuilder()
       .setCustomId(`ticket_caption_${guildId}`)
-      .setTitle('Ticket Setup — Step 2 of 3');
+      .setTitle('Ticket Setup — Step 2 of 4');
 
     const captionInput = new TextInputBuilder()
       .setCustomId('caption')
@@ -193,18 +409,22 @@ async function handleTicketInteraction(interaction) {
   if (interaction.isModalSubmit() && customId.startsWith('ticket_caption_')) {
     const guildId = customId.replace('ticket_caption_', '');
     const caption = interaction.fields.getTextInputValue('caption');
-    const existing = setupState.get(guildId) || {};
-    setupState.set(guildId, { ...existing, caption });
+
+    await TicketSetupStateModel.findOneAndUpdate(
+      { guildId },
+      { caption, updatedAt: new Date() },
+      { upsert: true, new: true }
+    );
 
     const embed = new EmbedBuilder()
-      .setTitle('Ticket System Setup — Step 3 of 3')
+      .setTitle('Ticket System Setup — Step 3 of 4')
       .setDescription(
         'Caption saved.\n\n' +
         'Now select which roles will be able to **view and respond** to all tickets.\n' +
         'The member who opens a ticket will always have access to their own ticket channel regardless of this selection.'
       )
       .setColor(0x5865F2)
-      .setFooter({ text: 'Step 3 of 3 — Select support roles' });
+      .setFooter({ text: 'Step 3 of 4 — Select support roles' });
 
     const roleSelect = new RoleSelectMenuBuilder()
       .setCustomId(`ticket_setup_roles_${guildId}`)
@@ -220,32 +440,66 @@ async function handleTicketInteraction(interaction) {
     return true;
   }
 
-  // Step 3: Support roles selected — finalize setup
+  // Step 3: Roles selected — save and ask for transcript channel
   if (interaction.isRoleSelectMenu() && customId.startsWith('ticket_setup_roles_')) {
     const guildId = customId.replace('ticket_setup_roles_', '');
-    const state = setupState.get(guildId);
 
+    const state = await TicketSetupStateModel.findOne({ guildId });
     if (!state || !state.channelId) {
-      await interaction.reply({
-        content: 'Setup session expired. Please run `/setticket` again.',
-        ephemeral: false
-      });
+      await interaction.reply({ content: 'Setup session expired. Please run `/setticket` again.', ephemeral: false });
       return true;
     }
 
-    const { channelId, caption } = state;
-    const allowedRoles = interaction.values;
+    await TicketSetupStateModel.findOneAndUpdate(
+      { guildId },
+      { allowedRoles: interaction.values, updatedAt: new Date() }
+    );
 
-    // Try to delete a previous panel message if reconfiguring
+    const embed = new EmbedBuilder()
+      .setTitle('Ticket System Setup — Step 4 of 4')
+      .setDescription(
+        'Support roles saved.\n\n' +
+        'Finally, select a **staff-only channel** where ticket transcripts will be posted when a ticket is closed.\n\n' +
+        'This gives your team a permanent record of every case for accountability and future review.'
+      )
+      .setColor(0x5865F2)
+      .setFooter({ text: 'Step 4 of 4 — Select transcript log channel' });
+
+    const transcriptChanSelect = new ChannelSelectMenuBuilder()
+      .setCustomId(`ticket_setup_transcript_${guildId}`)
+      .setPlaceholder('Select a channel for transcript logs...')
+      .setChannelTypes([ChannelType.GuildText])
+      .setMinValues(1)
+      .setMaxValues(1);
+
+    await interaction.reply({
+      embeds: [embed],
+      components: [new ActionRowBuilder().addComponents(transcriptChanSelect)],
+      ephemeral: false
+    });
+    return true;
+  }
+
+  // Step 4: Transcript channel selected — finalize setup
+  if (interaction.isChannelSelectMenu() && customId.startsWith('ticket_setup_transcript_')) {
+    const guildId = customId.replace('ticket_setup_transcript_', '');
+
+    const state = await TicketSetupStateModel.findOne({ guildId });
+    if (!state || !state.channelId) {
+      await interaction.reply({ content: 'Setup session expired. Please run `/setticket` again.', ephemeral: false });
+      return true;
+    }
+
+    const { channelId, caption, allowedRoles } = state;
+    const transcriptChannelId = interaction.values[0];
+
+    // Delete old panel if reconfiguring
     try {
       const existingConfig = await TicketConfigModel.findOne({ guildId });
       if (existingConfig?.panelMessageId) {
         const oldChan = interaction.guild.channels.cache.get(existingConfig.channelId);
         if (oldChan) {
-          await oldChan.messages
-            .fetch(existingConfig.panelMessageId)
-            .then(m => m.delete())
-            .catch(() => {});
+          await oldChan.messages.fetch(existingConfig.panelMessageId).then(m => m.delete()).catch(() => {});
         }
       }
     } catch (_) {}
@@ -253,13 +507,12 @@ async function handleTicketInteraction(interaction) {
     const targetChannel = interaction.guild.channels.cache.get(channelId);
     if (!targetChannel) {
       await interaction.reply({
-        content: 'The selected channel no longer exists. Please run `/setticket` again and pick a valid channel.',
+        content: 'The selected panel channel no longer exists. Please run `/setticket` again.',
         ephemeral: false
       });
       return true;
     }
 
-    // Send the panel to the chosen channel
     let panelMsg;
     try {
       const panelEmbed = buildTicketPanelEmbed(caption);
@@ -273,28 +526,28 @@ async function handleTicketInteraction(interaction) {
     } catch (e) {
       console.error('Ticket panel send error:', e);
       await interaction.reply({
-        content: `Failed to post the ticket panel in <#${channelId}>. Please make sure I have permission to send messages and embeds in that channel.`,
+        content: `Failed to post the ticket panel in <#${channelId}>. Make sure I have permission to send messages there.`,
         ephemeral: false
       });
       return true;
     }
 
-    // Save config
     await TicketConfigModel.findOneAndUpdate(
       { guildId },
-      { guildId, channelId, caption, allowedRoles, panelMessageId: panelMsg.id },
+      { guildId, channelId, caption, allowedRoles, panelMessageId: panelMsg.id, transcriptChannelId },
       { upsert: true, new: true }
     );
 
-    setupState.delete(guildId);
+    await TicketSetupStateModel.deleteOne({ guildId });
 
     const rolesMentions = allowedRoles.map(r => `<@&${r}>`).join(', ');
     const confirmEmbed = new EmbedBuilder()
       .setTitle('Ticket System Configured')
-      .setDescription(`The ticket panel has been posted in <#${channelId}>. Your members can now open tickets.`)
+      .setDescription(`The ticket panel has been posted in <#${channelId}>. Members can now open tickets.`)
       .addFields(
         { name: 'Caption', value: caption, inline: false },
-        { name: 'Support Roles', value: rolesMentions, inline: false }
+        { name: 'Support Roles', value: rolesMentions, inline: false },
+        { name: 'Transcript Log Channel', value: `<#${transcriptChannelId}>`, inline: false }
       )
       .setColor(0x57F287)
       .setTimestamp();
@@ -309,10 +562,7 @@ async function handleTicketInteraction(interaction) {
     const config = await TicketConfigModel.findOne({ guildId });
 
     if (!config) {
-      await interaction.reply({
-        content: 'The ticket system is not properly configured for this server.',
-        ephemeral: false
-      });
+      await interaction.reply({ content: 'The ticket system is not properly configured for this server.', ephemeral: false });
       return true;
     }
 
@@ -379,9 +629,7 @@ async function handleTicketInteraction(interaction) {
       });
     } catch (e) {
       console.error('Error creating ticket channel:', e);
-      await interaction.editReply({
-        content: 'Failed to create the ticket channel. Please ensure I have the **Manage Channels** permission.'
-      });
+      await interaction.editReply({ content: 'Failed to create the ticket channel. Please ensure I have the **Manage Channels** permission.' });
       return true;
     }
 
@@ -398,19 +646,84 @@ async function handleTicketInteraction(interaction) {
       .setColor(0x5865F2)
       .setTimestamp();
 
-    await ticketChannel.send({
-      content: roleMentions || null,
-      embeds: [greetingEmbed]
-    });
+    await ticketChannel.send({ content: roleMentions || null, embeds: [greetingEmbed] });
 
     await ActiveTicketModel.create({
       guildId,
       channelId: ticketChannel.id,
       creatorId: creator.id,
-      locked: false
+      locked: false,
+      closed: false,
+      transcriptSaved: false
     });
 
     await interaction.editReply({ content: `Your ticket has been created: ${ticketChannel}` });
+    return true;
+  }
+
+  // Reopen button (from close embed)
+  if (interaction.isButton() && customId.startsWith('ticket_reopen_')) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      await interaction.reply({ content: 'You need the **Manage Server** permission to reopen tickets.', ephemeral: false });
+      return true;
+    }
+
+    const channelId = customId.replace('ticket_reopen_', '');
+    const ticket = await ActiveTicketModel.findOne({ channelId });
+    if (!ticket) {
+      await interaction.reply({ content: 'Ticket not found.', ephemeral: false });
+      return true;
+    }
+
+    // Only restore the creator's SendMessages — staff was never touched
+    await interaction.channel.permissionOverwrites.edit(ticket.creatorId, {
+      ViewChannel: true,
+      SendMessages: true,
+      ReadMessageHistory: true
+    }).catch(() => {});
+
+    await ActiveTicketModel.findOneAndUpdate({ channelId }, { closed: false });
+
+    const reopenEmbed = new EmbedBuilder()
+      .setDescription(`🔓 Ticket reopened by ${interaction.user}. The member can send messages again.`)
+      .setColor(0x57F287);
+
+    await interaction.update({ embeds: [reopenEmbed], components: [] });
+    return true;
+  }
+
+  // Save Transcript & Delete button (from close embed)
+  if (interaction.isButton() && customId.startsWith('ticket_transcript_delete_')) {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      await interaction.reply({ content: 'You need the **Manage Server** permission to save transcripts.', ephemeral: false });
+      return true;
+    }
+
+    const channelId = customId.replace('ticket_transcript_delete_', '');
+    const ticket = await ActiveTicketModel.findOne({ channelId });
+    if (!ticket) {
+      await interaction.reply({ content: 'Ticket not found.', ephemeral: false });
+      return true;
+    }
+
+    await interaction.deferUpdate();
+
+    try {
+      const transcriptChan = await postTranscript(interaction.guild, interaction.channel, ticket, interaction.user.id);
+      await ActiveTicketModel.findOneAndUpdate({ channelId }, { transcriptSaved: true });
+
+      const savedEmbed = new EmbedBuilder()
+        .setDescription(`📋 Transcript saved${transcriptChan ? ` in ${transcriptChan}` : ''}. Deleting channel in 5 seconds…`)
+        .setColor(0x5865F2);
+
+      await interaction.editReply({ embeds: [savedEmbed], components: [] });
+      await new Promise(r => setTimeout(r, 5000));
+      await ActiveTicketModel.deleteOne({ channelId }).catch(() => {});
+      await interaction.channel.delete('Transcript saved and ticket deleted').catch(() => {});
+    } catch (e) {
+      console.error('Transcript+delete error:', e);
+      await interaction.editReply({ content: `Failed to save transcript: ${e.message}` }).catch(() => {});
+    }
     return true;
   }
 
@@ -455,10 +768,7 @@ async function handleTicketInteraction(interaction) {
       ? selectedRoles.map(r => `<@&${r}>`).join(', ')
       : 'None — only the ticket creator can see this channel now.';
 
-    await interaction.reply({
-      content: `Ticket access updated. Roles with access: ${rolesMentions}`,
-      ephemeral: false
-    });
+    await interaction.reply({ content: `Ticket access updated. Roles with access: ${rolesMentions}`, ephemeral: false });
     return true;
   }
 
