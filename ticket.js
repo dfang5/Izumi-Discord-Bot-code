@@ -89,28 +89,6 @@ function buildControlPanelRow(channelId) {
   );
 }
 
-// ---- Control panel refresh ----
-
-async function refreshControlPanel(ticketChannel, creatorId, locked, oldMessageId) {
-  if (oldMessageId) {
-    await ticketChannel.messages
-      .fetch(oldMessageId)
-      .then(m => m.delete())
-      .catch(() => {});
-  }
-
-  const embed = buildControlPanelEmbed(ticketChannel, creatorId, locked);
-  const row = buildControlPanelRow(ticketChannel.id);
-  const newMsg = await ticketChannel.send({ embeds: [embed], components: [row] });
-
-  await ActiveTicketModel.findOneAndUpdate(
-    { channelId: ticketChannel.id },
-    { controlPanelMessageId: newMsg.id }
-  ).catch(() => {});
-
-  return newMsg;
-}
-
 // ---- Slash command handler (/setticket) ----
 
 async function handleSetTicketCommand(interaction) {
@@ -422,8 +400,8 @@ async function handleTicketInteraction(interaction) {
 
     await ticketChannel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false });
     await ActiveTicketModel.findOneAndUpdate({ channelId }, { locked: true });
-    await interaction.deferUpdate();
-    await refreshControlPanel(ticketChannel, ticket.creatorId, true, ticket.controlPanelMessageId);
+    const lockedEmbed = buildControlPanelEmbed(ticketChannel, ticket.creatorId, true);
+    await interaction.update({ embeds: [lockedEmbed], components: [buildControlPanelRow(channelId)] });
     return true;
   }
 
@@ -444,8 +422,8 @@ async function handleTicketInteraction(interaction) {
 
     await ticketChannel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: null });
     await ActiveTicketModel.findOneAndUpdate({ channelId }, { locked: false });
-    await interaction.deferUpdate();
-    await refreshControlPanel(ticketChannel, ticket.creatorId, false, ticket.controlPanelMessageId);
+    const unlockedEmbed = buildControlPanelEmbed(ticketChannel, ticket.creatorId, false);
+    await interaction.update({ embeds: [unlockedEmbed], components: [buildControlPanelRow(channelId)] });
     return true;
   }
 
@@ -552,26 +530,6 @@ async function handleTicketInteraction(interaction) {
   return false;
 }
 
-// Called from messageCreate — keeps the control panel pinned to the bottom
-async function handleTicketMessageCreate(message) {
-  if (message.author.bot) return;
-  if (!message.guild) return;
-
-  const ticket = await ActiveTicketModel.findOne({
-    guildId: message.guild.id,
-    channelId: message.channel.id
-  }).lean();
-
-  if (!ticket) return;
-
-  await refreshControlPanel(
-    message.channel,
-    ticket.creatorId,
-    ticket.locked,
-    ticket.controlPanelMessageId
-  ).catch(() => {});
-}
-
 async function loadTicketConfigs() {
   const ticketCount = await TicketConfigModel.countDocuments();
   const activeCount = await ActiveTicketModel.countDocuments();
@@ -581,6 +539,5 @@ async function loadTicketConfigs() {
 module.exports = {
   handleSetTicketCommand,
   handleTicketInteraction,
-  handleTicketMessageCreate,
   loadTicketConfigs
 };
