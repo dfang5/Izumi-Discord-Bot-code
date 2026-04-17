@@ -223,7 +223,11 @@ const commands = [
     .setName('ticket')
     .setDescription('Ticket management commands')
     .addSubcommand(sub =>
-      sub.setName('close').setDescription('Close and delete this ticket channel'))
+      sub.setName('close').setDescription('Soft-close this ticket — members cannot send messages, but the channel is kept'))
+    .addSubcommand(sub =>
+      sub.setName('transcript').setDescription('Save a transcript of this ticket to the log channel, then delete the channel'))
+    .addSubcommand(sub =>
+      sub.setName('delete').setDescription('Delete this ticket channel immediately (warns if no transcript was saved)'))
     .addSubcommand(sub =>
       sub.setName('lock').setDescription('Prevent members from sending messages in this ticket'))
     .addSubcommand(sub =>
@@ -863,7 +867,6 @@ client.on('messageCreate', async message => {
     const handled = await checkAdvancedRestrictions(message);
     if (handled) return;
 
-    
   }
 
   // Status auto-reply when the bot owner is mentioned
