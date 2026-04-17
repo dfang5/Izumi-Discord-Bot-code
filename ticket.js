@@ -164,7 +164,7 @@ async function handleTicketInteraction(interaction) {
 
     const captionInput = new TextInputBuilder()
       .setCustomId('caption')
-      .setLabel('Caption (shown above the Create Ticket button)')
+      .setLabel('Caption shown above the Create Ticket button')
       .setStyle(TextInputStyle.Paragraph)
       .setPlaceholder('e.g. Need assistance? Open a ticket and our team will respond promptly.')
       .setRequired(true)
