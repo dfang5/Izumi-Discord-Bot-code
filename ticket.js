@@ -28,7 +28,6 @@ const ActiveTicketSchema = new mongoose.Schema({
   guildId: { type: String, required: true },
   channelId: { type: String, required: true, unique: true },
   creatorId: { type: String, required: true },
-  controlPanelMessageId: { type: String, default: null },
   locked: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
@@ -46,69 +45,6 @@ function buildTicketPanelEmbed(caption) {
     .setColor(0x2B2D31)
     .setFooter({ text: 'A private channel will be created for you and the support team only.' })
     .setTimestamp();
-}
-
-function buildControlPanelEmbed(ticketChannel, creatorId, locked) {
-  return new EmbedBuilder()
-    .setTitle('Ticket — Active Session')
-    .setDescription(
-      `This ticket was opened by <@${creatorId}>.\n` +
-      `The designated support staff will attend to you shortly.\n\n` +
-      `**You may close this ticket at any time using the button below.**`
-    )
-    .addFields({
-      name: 'Status',
-      value: locked
-        ? 'Locked — message input is currently disabled for this channel.'
-        : 'Open — this session is active and accepting messages.',
-      inline: false
-    })
-    .setColor(locked ? 0xFF6B6B : 0x57F287)
-    .setFooter({ text: `Ticket channel: ${ticketChannel.name} — ID: ${ticketChannel.id}` })
-    .setTimestamp();
-}
-
-function buildControlPanelRow(channelId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`ticket_lock_${channelId}`)
-      .setLabel('Lock')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(`ticket_unlock_${channelId}`)
-      .setLabel('Unlock')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(`ticket_close_${channelId}`)
-      .setLabel('Close')
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId(`ticket_configure_${channelId}`)
-      .setLabel('Configure')
-      .setStyle(ButtonStyle.Primary)
-  );
-}
-
-// ---- Control panel refresh ----
-
-async function refreshControlPanel(ticketChannel, creatorId, locked, oldMessageId) {
-  if (oldMessageId) {
-    await ticketChannel.messages
-      .fetch(oldMessageId)
-      .then(m => m.delete())
-      .catch(() => {});
-  }
-
-  const embed = buildControlPanelEmbed(ticketChannel, creatorId, locked);
-  const row = buildControlPanelRow(ticketChannel.id);
-  const newMsg = await ticketChannel.send({ embeds: [embed], components: [row] });
-
-  await ActiveTicketModel.findOneAndUpdate(
-    { channelId: ticketChannel.id },
-    { controlPanelMessageId: newMsg.id }
-  ).catch(() => {});
-
-  return newMsg;
 }
 
 // ---- Slash command handler (/setticket) ----
@@ -143,6 +79,84 @@ async function handleSetTicketCommand(interaction) {
     components: [new ActionRowBuilder().addComponents(channelSelect)],
     ephemeral: false
   });
+}
+
+// ---- Slash command handler (/ticket <subcommand>) ----
+
+async function handleTicketCommand(interaction) {
+  const subcommand = interaction.options.getSubcommand();
+  const channelId = interaction.channel.id;
+  const guildId = interaction.guild.id;
+
+  const ticket = await ActiveTicketModel.findOne({ channelId, guildId });
+
+  if (!ticket) {
+    await interaction.reply({
+      content: 'This command can only be used inside an active ticket channel.',
+      ephemeral: false
+    });
+    return;
+  }
+
+  const isStaff = interaction.member.permissions.has(PermissionFlagsBits.ManageGuild);
+  const isCreator = interaction.user.id === ticket.creatorId;
+
+  if (subcommand === 'close') {
+    await interaction.reply({ content: 'Closing ticket. This channel will be deleted momentarily.' });
+    await ActiveTicketModel.deleteOne({ channelId }).catch(() => {});
+    await interaction.channel.delete('Ticket closed').catch(() => {});
+    return;
+  }
+
+  if (subcommand === 'lock') {
+    if (!isStaff) {
+      await interaction.reply({ content: 'You need the **Manage Server** permission to lock tickets.', ephemeral: false });
+      return;
+    }
+    await interaction.channel.permissionOverwrites.edit(guildId, { SendMessages: false });
+    await ActiveTicketModel.findOneAndUpdate({ channelId }, { locked: true });
+    await interaction.reply({ content: 'Ticket locked. Members can no longer send messages in this channel.' });
+    return;
+  }
+
+  if (subcommand === 'unlock') {
+    if (!isStaff) {
+      await interaction.reply({ content: 'You need the **Manage Server** permission to unlock tickets.', ephemeral: false });
+      return;
+    }
+    await interaction.channel.permissionOverwrites.edit(guildId, { SendMessages: null });
+    await ActiveTicketModel.findOneAndUpdate({ channelId }, { locked: false });
+    await interaction.reply({ content: 'Ticket unlocked. Members can now send messages again.' });
+    return;
+  }
+
+  if (subcommand === 'roles') {
+    if (!isStaff) {
+      await interaction.reply({ content: 'You need the **Manage Server** permission to reconfigure ticket roles.', ephemeral: false });
+      return;
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle('Reconfigure Ticket Access')
+      .setDescription(
+        'Select the roles that should have access to this ticket channel.\n\n' +
+        'The ticket creator will always retain access regardless of what is selected here.'
+      )
+      .setColor(0x5865F2);
+
+    const roleSelect = new RoleSelectMenuBuilder()
+      .setCustomId(`ticket_cfg_roles_${channelId}`)
+      .setPlaceholder('Select roles...')
+      .setMinValues(0)
+      .setMaxValues(25);
+
+    await interaction.reply({
+      embeds: [embed],
+      components: [new ActionRowBuilder().addComponents(roleSelect)],
+      ephemeral: false
+    });
+    return;
+  }
 }
 
 // ---- Main interaction router ----
@@ -389,15 +403,10 @@ async function handleTicketInteraction(interaction) {
       embeds: [greetingEmbed]
     });
 
-    const controlEmbed = buildControlPanelEmbed(ticketChannel, creator.id, false);
-    const controlRow = buildControlPanelRow(ticketChannel.id);
-    const controlMsg = await ticketChannel.send({ embeds: [controlEmbed], components: [controlRow] });
-
     await ActiveTicketModel.create({
       guildId,
       channelId: ticketChannel.id,
       creatorId: creator.id,
-      controlPanelMessageId: controlMsg.id,
       locked: false
     });
 
@@ -405,103 +414,7 @@ async function handleTicketInteraction(interaction) {
     return true;
   }
 
-  // Lock button
-  if (interaction.isButton() && customId.startsWith('ticket_lock_')) {
-    const channelId = customId.replace('ticket_lock_', '');
-    const ticket = await ActiveTicketModel.findOne({ channelId });
-    if (!ticket) {
-      await interaction.reply({ content: 'This ticket record no longer exists.', ephemeral: false });
-      return true;
-    }
-
-    const ticketChannel = interaction.guild.channels.cache.get(channelId);
-    if (!ticketChannel) {
-      await interaction.reply({ content: 'Ticket channel not found.', ephemeral: false });
-      return true;
-    }
-
-    await ticketChannel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false });
-    await ActiveTicketModel.findOneAndUpdate({ channelId }, { locked: true });
-    await interaction.deferUpdate();
-    await refreshControlPanel(ticketChannel, ticket.creatorId, true, ticket.controlPanelMessageId);
-    return true;
-  }
-
-  // Unlock button
-  if (interaction.isButton() && customId.startsWith('ticket_unlock_')) {
-    const channelId = customId.replace('ticket_unlock_', '');
-    const ticket = await ActiveTicketModel.findOne({ channelId });
-    if (!ticket) {
-      await interaction.reply({ content: 'This ticket record no longer exists.', ephemeral: false });
-      return true;
-    }
-
-    const ticketChannel = interaction.guild.channels.cache.get(channelId);
-    if (!ticketChannel) {
-      await interaction.reply({ content: 'Ticket channel not found.', ephemeral: false });
-      return true;
-    }
-
-    await ticketChannel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: null });
-    await ActiveTicketModel.findOneAndUpdate({ channelId }, { locked: false });
-    await interaction.deferUpdate();
-    await refreshControlPanel(ticketChannel, ticket.creatorId, false, ticket.controlPanelMessageId);
-    return true;
-  }
-
-  // Close (delete) button
-  if (interaction.isButton() && customId.startsWith('ticket_close_')) {
-    const channelId = customId.replace('ticket_close_', '');
-
-    await interaction.reply({
-      content: 'Closing this ticket. The channel will be deleted momentarily.',
-      ephemeral: false
-    });
-
-    const ticketChannel = interaction.guild.channels.cache.get(channelId);
-    if (ticketChannel) {
-      await ticketChannel.delete('Ticket closed').catch(() => {});
-    }
-
-    await ActiveTicketModel.deleteOne({ channelId }).catch(() => {});
-    return true;
-  }
-
-  // Configure button — change roles for a live ticket
-  if (interaction.isButton() && customId.startsWith('ticket_configure_')) {
-    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      await interaction.reply({
-        content: 'You need the **Manage Server** permission to reconfigure ticket roles.',
-        ephemeral: false
-      });
-      return true;
-    }
-
-    const channelId = customId.replace('ticket_configure_', '');
-
-    const embed = new EmbedBuilder()
-      .setTitle('Reconfigure Ticket Access')
-      .setDescription(
-        'Select the roles that should have access to this ticket channel.\n\n' +
-        'The ticket creator will always retain access regardless of what is selected here.'
-      )
-      .setColor(0x5865F2);
-
-    const roleSelect = new RoleSelectMenuBuilder()
-      .setCustomId(`ticket_cfg_roles_${channelId}`)
-      .setPlaceholder('Select roles...')
-      .setMinValues(0)
-      .setMaxValues(25);
-
-    await interaction.reply({
-      embeds: [embed],
-      components: [new ActionRowBuilder().addComponents(roleSelect)],
-      ephemeral: false
-    });
-    return true;
-  }
-
-  // Configure role select — apply updated roles to a live ticket channel
+  // /ticket roles — role select response
   if (interaction.isRoleSelectMenu() && customId.startsWith('ticket_cfg_roles_')) {
     const channelId = customId.replace('ticket_cfg_roles_', '');
     const ticket = await ActiveTicketModel.findOne({ channelId });
@@ -552,26 +465,6 @@ async function handleTicketInteraction(interaction) {
   return false;
 }
 
-// Called from messageCreate — keeps the control panel pinned to the bottom
-async function handleTicketMessageCreate(message) {
-  if (message.author.bot) return;
-  if (!message.guild) return;
-
-  const ticket = await ActiveTicketModel.findOne({
-    guildId: message.guild.id,
-    channelId: message.channel.id
-  }).lean();
-
-  if (!ticket) return;
-
-  await refreshControlPanel(
-    message.channel,
-    ticket.creatorId,
-    ticket.locked,
-    ticket.controlPanelMessageId
-  ).catch(() => {});
-}
-
 async function loadTicketConfigs() {
   const ticketCount = await TicketConfigModel.countDocuments();
   const activeCount = await ActiveTicketModel.countDocuments();
@@ -580,7 +473,7 @@ async function loadTicketConfigs() {
 
 module.exports = {
   handleSetTicketCommand,
+  handleTicketCommand,
   handleTicketInteraction,
-  handleTicketMessageCreate,
   loadTicketConfigs
 };
