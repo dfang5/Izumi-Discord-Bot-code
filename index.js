@@ -863,8 +863,7 @@ client.on('messageCreate', async message => {
     const handled = await checkAdvancedRestrictions(message);
     if (handled) return;
 
-    // Ticket control panel — keep it pinned to the bottom of ticket channels
-    await handleTicketMessageCreate(message);
+    
   }
 
   // Status auto-reply when the bot owner is mentioned
