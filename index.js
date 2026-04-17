@@ -3,8 +3,8 @@ const { calculateRisk } = require('./risks');
 const { makeCheckEmbed } = require('./embeds');
 const {
   handleSetTicketCommand,
+  handleTicketCommand,
   handleTicketInteraction,
-  handleTicketMessageCreate,
   loadTicketConfigs
 } = require('./ticket');
 const mongoose = require('mongoose');
@@ -217,7 +217,19 @@ const commands = [
   new SlashCommandBuilder()
     .setName('setticket')
     .setDescription('Set up the ticket system for this server')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName('ticket')
+    .setDescription('Ticket management commands')
+    .addSubcommand(sub =>
+      sub.setName('close').setDescription('Close and delete this ticket channel'))
+    .addSubcommand(sub =>
+      sub.setName('lock').setDescription('Prevent members from sending messages in this ticket'))
+    .addSubcommand(sub =>
+      sub.setName('unlock').setDescription('Allow members to send messages in this ticket again'))
+    .addSubcommand(sub =>
+      sub.setName('roles').setDescription('Update which roles have access to this ticket'))
 ];
 
 // Helper functions for permissions
@@ -1071,10 +1083,10 @@ client.on('interactionCreate', async interaction => {
         const targetId = interaction.options.getString('userid') || (targetUser ? targetUser.id : null);
 
         if (!targetId) {
-          return interaction.reply({ content: 'Please provide either a user or a user ID.', ephemeral: true });
+          return interaction.reply({ content: 'Please provide either a user or a user ID.', ephemeral: false });
         }
 
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ ephemeral: false });
 
         try {
           let totalDeleted = 0;
@@ -1272,7 +1284,7 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'say') {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: 'You need administrator permissions to use this command.', ephemeral: true });
+        return interaction.reply({ content: 'You need administrator permissions to use this command.', ephemeral: false });
       }
 
       const targetChannel = interaction.options.getChannel('channel');
@@ -1280,7 +1292,7 @@ client.on('interactionCreate', async interaction => {
 
       // Verify the channel is a text channel in the same guild
       if (!targetChannel || targetChannel.type !== ChannelType.GuildText || targetChannel.guild.id !== interaction.guild.id) {
-        return interaction.reply({ content: 'Invalid channel selected. Please choose a text channel from this server.', ephemeral: true });
+        return interaction.reply({ content: 'Invalid channel selected. Please choose a text channel from this server.', ephemeral: false });
       }
 
       try {
@@ -1289,13 +1301,13 @@ client.on('interactionCreate', async interaction => {
 
         return interaction.reply({ 
           content: ` Message sent to ${targetChannel}`, 
-          ephemeral: true 
+          ephemeral: false 
         });
       } catch (error) {
         console.error('Error sending message:', error);
         return interaction.reply({ 
           content: 'Failed to send message. Check bot permissions for that channel.', 
-          ephemeral: true 
+          ephemeral: false 
         });
       }
     }
@@ -1339,23 +1351,23 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'quarantine') {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: 'You need administrator permissions to quarantine users.', ephemeral: true });
+        return interaction.reply({ content: 'You need administrator permissions to quarantine users.', ephemeral: false });
       }
 
       const target = interaction.options.getUser('user');
       const member = await interaction.guild.members.fetch(target.id).catch(() => null);
 
       if (!member) {
-        return interaction.reply({ content: 'That user is not in this server.', ephemeral: true });
+        return interaction.reply({ content: 'That user is not in this server.', ephemeral: false });
       }
 
       if (isAdmin(member)) {
-        return interaction.reply({ content: 'You cannot quarantine an administrator.', ephemeral: true });
+        return interaction.reply({ content: 'You cannot quarantine an administrator.', ephemeral: false });
       }
 
       const quarantineRole = interaction.guild.roles.cache.find(r => r.name === 'Quarantined');
       if (quarantineRole && member.roles.cache.has(quarantineRole.id)) {
-        return interaction.reply({ content: `**${target.tag}** is already quarantined.`, ephemeral: true });
+        return interaction.reply({ content: `**${target.tag}** is already quarantined.`, ephemeral: false });
       }
 
       await interaction.deferReply();
@@ -1389,19 +1401,19 @@ client.on('interactionCreate', async interaction => {
 
     if (commandName === 'allow') {
       if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: 'You need administrator permissions to release users from quarantine.', ephemeral: true });
+        return interaction.reply({ content: 'You need administrator permissions to release users from quarantine.', ephemeral: false });
       }
 
       const target = interaction.options.getUser('user');
       const member = await interaction.guild.members.fetch(target.id).catch(() => null);
 
       if (!member) {
-        return interaction.reply({ content: 'That user is not in this server.', ephemeral: true });
+        return interaction.reply({ content: 'That user is not in this server.', ephemeral: false });
       }
 
       const quarantineRole = interaction.guild.roles.cache.find(r => r.name === 'Quarantined');
       if (!quarantineRole || !member.roles.cache.has(quarantineRole.id)) {
-        return interaction.reply({ content: 'That user is not currently quarantined.', ephemeral: true });
+        return interaction.reply({ content: 'That user is not currently quarantined.', ephemeral: false });
       }
 
       await interaction.deferReply();
@@ -1497,7 +1509,7 @@ client.on('interactionCreate', async interaction => {
       const subcommand = interaction.options.getSubcommand();
       if (subcommand === 'toggle') {
         if (!isAdmin(interaction.member)) {
-          return interaction.reply({ content: 'You need administrator permissions to configure advanced restrictions.', ephemeral: true });
+          return interaction.reply({ content: 'You need administrator permissions to configure advanced restrictions.', ephemeral: false });
         }
 
         const embed = new EmbedBuilder()
@@ -1526,14 +1538,18 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (commandName === 'setticket') {
-      return handleSetTicketCommand(interaction);
+      return await handleSetTicketCommand(interaction);
+    }
+
+    if (commandName === 'ticket') {
+      return await handleTicketCommand(interaction);
     }
 
     if (commandName === 'configure') {
       const subcommand = interaction.options.getSubcommand();
       if (subcommand === 'quarantine') {
         if (!isAdmin(interaction.member)) {
-          return interaction.reply({ content: 'You need administrator permissions to configure quarantine.', ephemeral: true });
+          return interaction.reply({ content: 'You need administrator permissions to configure quarantine.', ephemeral: false });
         }
 
         const config = getServerConfig(interaction.guild.id);
@@ -1612,7 +1628,7 @@ client.on('interactionCreate', async interaction => {
   // Advanced config: channel select
   if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('adv_chan_')) {
     if (!isAdmin(interaction.member)) {
-      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: false });
     }
     const channelId = interaction.values[0];
     const panel = buildAdvancedPanel(interaction.guild, channelId);
@@ -1622,7 +1638,7 @@ client.on('interactionCreate', async interaction => {
   // Advanced config: restricted roles select
   if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('adv_roles_restrict_')) {
     if (!isAdmin(interaction.member)) {
-      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: false });
     }
     const channelId = interaction.customId.replace('adv_roles_restrict_', '');
     const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
@@ -1635,7 +1651,7 @@ client.on('interactionCreate', async interaction => {
   // Advanced config: exempt roles select
   if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('adv_roles_exempt_')) {
     if (!isAdmin(interaction.member)) {
-      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: false });
     }
     const channelId = interaction.customId.replace('adv_roles_exempt_', '');
     const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
@@ -1648,7 +1664,7 @@ client.on('interactionCreate', async interaction => {
   // Advanced config: exempt users select
   if (interaction.isUserSelectMenu() && interaction.customId.startsWith('adv_users_exempt_')) {
     if (!isAdmin(interaction.member)) {
-      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: false });
     }
     const channelId = interaction.customId.replace('adv_users_exempt_', '');
     const cfg = getAdvancedChannelConfig(interaction.guild.id, channelId);
@@ -1661,13 +1677,13 @@ client.on('interactionCreate', async interaction => {
   // Advanced config: warning timer modal submission
   if (interaction.isModalSubmit() && interaction.customId.startsWith('adv_timer_modal_')) {
     if (!isAdmin(interaction.member)) {
-      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: false });
     }
     const channelId = interaction.customId.replace('adv_timer_modal_', '');
     const raw = interaction.fields.getTextInputValue('timer_value').trim();
     const parsed = parseInt(raw, 10);
     if (isNaN(parsed) || parsed < 0) {
-      return interaction.reply({ content: 'Please enter a valid number of seconds (0 for never).', ephemeral: true });
+      return interaction.reply({ content: 'Please enter a valid number of seconds (0 for never).', ephemeral: false });
     }
     const serverCfg = getServerConfig(interaction.guild.id);
     serverCfg.warnDeleteTimeout = parsed === 0 ? null : parsed;
@@ -1683,7 +1699,7 @@ client.on('interactionCreate', async interaction => {
   // Advanced config: mode buttons
   if (interaction.customId.startsWith('adv_mode_')) {
     if (!isAdmin(interaction.member)) {
-      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: false });
     }
     const parts = interaction.customId.split('_');
     const mode = parts[2];
@@ -1707,14 +1723,14 @@ client.on('interactionCreate', async interaction => {
       return interaction.update({ embeds: [embed], components });
     } catch (error) {
       console.error('Error updating behaviour summary:', error);
-      return interaction.reply({ content: 'Failed to load activity data.', ephemeral: true });
+      return interaction.reply({ content: 'Failed to load activity data.', ephemeral: false });
     }
   }
 
   // Advanced config: warning timer button — opens a modal
   if (interaction.customId.startsWith('adv_timer_')) {
     if (!isAdmin(interaction.member)) {
-      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: false });
     }
     const channelId = interaction.customId.replace('adv_timer_', '');
     const serverCfg = getServerConfig(interaction.guild.id);
@@ -1736,7 +1752,7 @@ client.on('interactionCreate', async interaction => {
   // Handle quarantine config toggle buttons
   if (interaction.customId.startsWith('qconfig_')) {
     if (!isAdmin(interaction.member)) {
-      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: true });
+      return interaction.reply({ content: 'You need administrator permissions.', ephemeral: false });
     }
 
     const parts = interaction.customId.split('_');
@@ -1871,13 +1887,13 @@ client.on('interactionCreate', async interaction => {
 
     if (!interaction.replied && !interaction.deferred) {
       try {
-        await interaction.reply({ content: 'An error occurred while processing your request.', ephemeral: true });
+        await interaction.reply({ content: 'An error occurred while processing your request.', ephemeral: false });
       } catch (e) {
         console.error('Failed to send error reply:', e);
       }
     } else {
       try {
-        await interaction.followUp({ content: 'An error occurred while processing your request.', ephemeral: true });
+        await interaction.followUp({ content: 'An error occurred while processing your request.', ephemeral: false });
       } catch (e) {
         console.error('Failed to send error followup:', e);
       }
