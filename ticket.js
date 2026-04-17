@@ -10,7 +10,7 @@ const {
   TextInputStyle,
   PermissionFlagsBits,
   ChannelType,
-  AttachmentBuilder
+  escapeMarkdown
 } = require('discord.js');
 const mongoose = require('mongoose');
 
@@ -37,7 +37,7 @@ const ActiveTicketSchema = new mongoose.Schema({
 });
 const ActiveTicketModel = mongoose.model('IzumiActiveTicket', ActiveTicketSchema);
 
-// DB-backed setup state so it survives bot restarts/redeployments
+// DB-backed setup state — survives bot restarts and redeployments
 const TicketSetupStateSchema = new mongoose.Schema({
   guildId: { type: String, required: true, unique: true },
   channelId: { type: String, default: null },
@@ -47,15 +47,109 @@ const TicketSetupStateSchema = new mongoose.Schema({
 });
 const TicketSetupStateModel = mongoose.model('IzumiTicketSetupState', TicketSetupStateSchema);
 
-// ---- Helpers ----
+// Stored transcripts for paginated embed navigation
+const TranscriptSchema = new mongoose.Schema({
+  guildId: { type: String, required: true },
+  channelName: { type: String, required: true },
+  creatorId: { type: String, required: true },
+  creatorName: { type: String, default: null },
+  closedById: { type: String, default: null },
+  closedByName: { type: String, default: null },
+  pages: { type: [String], required: true },
+  totalMessages: { type: Number, default: 0 },
+  openedAt: { type: Date, default: null },
+  savedAt: { type: Date, default: Date.now }
+});
+const TranscriptModel = mongoose.model('IzumiTranscript', TranscriptSchema);
 
-function buildTicketPanelEmbed(caption) {
-  return new EmbedBuilder()
-    .setTitle('Support Tickets')
-    .setDescription(caption)
-    .setColor(0x2B2D31)
-    .setFooter({ text: 'A private channel will be created for you and the support team only.' })
-    .setTimestamp();
+// ---- Transcript helpers ----
+
+const PAGE_LIMIT = 3800;
+
+function buildPages(messages) {
+  const pad = n => String(n).padStart(2, '0');
+  const pages = [];
+  let current = '';
+
+  for (const m of messages) {
+    const d = new Date(m.createdTimestamp);
+    const time = `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+    const author = m.author ? escapeMarkdown(m.author.username) : 'Unknown';
+
+    let content = m.content || '';
+    if (m.attachments.size > 0) {
+      content += (content ? ' ' : '') + `[${m.attachments.size} attachment(s)]`;
+    }
+    if (!content && m.embeds.length > 0) content = '[embed]';
+    if (!content) content = '[no content]';
+    if (content.length > 350) content = content.slice(0, 347) + '...';
+
+    const line = `\`${time}\` **${author}**: ${content}\n`;
+
+    if (current.length + line.length > PAGE_LIMIT) {
+      if (current) pages.push(current);
+      current = line;
+    } else {
+      current += line;
+    }
+  }
+
+  if (current) pages.push(current);
+  if (pages.length === 0) pages.push('*No messages found in this ticket.*');
+  return pages;
+}
+
+function buildTranscriptEmbed(transcript, pageIndex) {
+  const openedAt = transcript.openedAt
+    ? Math.floor(new Date(transcript.openedAt).getTime() / 1000)
+    : null;
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Ticket Transcript — #${transcript.channelName}`)
+    .setDescription(transcript.pages[pageIndex])
+    .setColor(0x5865F2)
+    .addFields(
+      {
+        name: 'Opened by',
+        value: transcript.creatorName
+          ? `${transcript.creatorName} (<@${transcript.creatorId}>)`
+          : `<@${transcript.creatorId}>`,
+        inline: true
+      },
+      {
+        name: 'Closed by',
+        value: transcript.closedByName
+          ? `${transcript.closedByName} (<@${transcript.closedById}>)`
+          : (transcript.closedById ? `<@${transcript.closedById}>` : 'Unknown'),
+        inline: true
+      },
+      { name: 'Messages', value: String(transcript.totalMessages), inline: true }
+    )
+    .setFooter({ text: `Page ${pageIndex + 1} of ${transcript.pages.length}` })
+    .setTimestamp(transcript.savedAt);
+
+  if (openedAt) {
+    embed.addFields({ name: 'Ticket opened', value: `<t:${openedAt}:f>`, inline: true });
+  }
+
+  return embed;
+}
+
+function buildTranscriptNav(transcriptId, currentPage, totalPages) {
+  if (totalPages <= 1) return [];
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`ticket_tr_prev_${transcriptId}_${currentPage}`)
+      .setLabel('< Previous')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage === 0),
+    new ButtonBuilder()
+      .setCustomId(`ticket_tr_next_${transcriptId}_${currentPage}`)
+      .setLabel('Next >')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage === totalPages - 1)
+  );
+  return [row];
 }
 
 async function fetchAllMessages(channel) {
@@ -78,76 +172,63 @@ async function fetchAllMessages(channel) {
   return messages.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 }
 
-function formatTranscript(channel, ticket, messages) {
-  const pad = n => String(n).padStart(2, '0');
-  const fmt = d => {
-    if (!d || !(d instanceof Date) || isNaN(d)) return 'Unknown';
-    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
-  };
-
-  const now = new Date();
-  const openedAt = ticket.createdAt instanceof Date ? ticket.createdAt : new Date(ticket.createdAt);
-
-  const header = [
-    '='.repeat(60),
-    'TICKET TRANSCRIPT',
-    `Channel  : #${channel.name} (${channel.id})`,
-    `Opened by: ${ticket.creatorId}`,
-    `Opened at: ${fmt(openedAt)}`,
-    `Exported : ${fmt(now)}`,
-    `Messages : ${messages.length}`,
-    '='.repeat(60),
-    ''
-  ].join('\n');
-
-  const body = messages.map(m => {
-    const ts = fmt(new Date(m.createdTimestamp));
-    const tag = m.author ? m.author.username : 'Unknown';
-    let text = m.content || '';
-    if (m.attachments.size > 0) {
-      text += (text ? '\n' : '') + [...m.attachments.values()].map(a => `[Attachment: ${a.url}]`).join('\n');
-    }
-    if (m.embeds.length > 0 && !text) text = '[Embed]';
-    return `[${ts}] ${tag}: ${text || '[no text content]'}`;
-  }).join('\n');
-
-  return header + body;
-}
-
-async function postTranscript(guild, channel, ticket, closedById) {
+async function postTranscript(guild, channel, ticket, closedByMember) {
   const config = await TicketConfigModel.findOne({ guildId: ticket.guildId });
   const transcriptChannelId = config?.transcriptChannelId;
 
   const messages = await fetchAllMessages(channel);
-  const text = formatTranscript(channel, ticket, messages);
-  const buffer = Buffer.from(text, 'utf-8');
-  const filename = `transcript-${channel.name}-${Date.now()}.txt`;
-  const attachment = new AttachmentBuilder(buffer, { name: filename });
+  const pages = buildPages(messages);
 
-  const openedAt = ticket.createdAt instanceof Date ? ticket.createdAt : new Date(ticket.createdAt);
-  const tsUnix = Math.floor((isNaN(openedAt) ? Date.now() : openedAt.getTime()) / 1000);
+  // Resolve display names for the embed
+  let creatorName = null;
+  try {
+    const creator = await guild.members.fetch(ticket.creatorId);
+    creatorName = creator.user.username;
+  } catch {}
 
-  const embed = new EmbedBuilder()
-    .setTitle('Ticket Transcript Saved')
-    .setColor(0x5865F2)
-    .addFields(
-      { name: 'Channel', value: `#${channel.name}`, inline: true },
-      { name: 'Opened by', value: `<@${ticket.creatorId}>`, inline: true },
-      { name: 'Closed by', value: closedById ? `<@${closedById}>` : 'Unknown', inline: true },
-      { name: 'Messages', value: String(messages.length), inline: true },
-      { name: 'Opened', value: `<t:${tsUnix}:f>`, inline: true }
-    )
-    .setTimestamp();
+  const closedById = closedByMember?.id ?? null;
+  const closedByName = closedByMember?.user?.username ?? null;
+
+  const openedAt = ticket.createdAt instanceof Date
+    ? ticket.createdAt
+    : (ticket.createdAt ? new Date(ticket.createdAt) : null);
+
+  const doc = await TranscriptModel.create({
+    guildId: ticket.guildId,
+    channelName: channel.name,
+    creatorId: ticket.creatorId,
+    creatorName,
+    closedById,
+    closedByName,
+    pages,
+    totalMessages: messages.length,
+    openedAt: openedAt && !isNaN(openedAt) ? openedAt : null
+  });
+
+  const transcriptId = doc._id.toString();
 
   if (transcriptChannelId) {
     const transcriptChan = guild.channels.cache.get(transcriptChannelId);
     if (transcriptChan) {
-      await transcriptChan.send({ embeds: [embed], files: [attachment] });
+      const embed = buildTranscriptEmbed(doc, 0);
+      const components = buildTranscriptNav(transcriptId, 0, pages.length);
+      await transcriptChan.send({ embeds: [embed], components });
       return transcriptChan;
     }
   }
 
   return null;
+}
+
+// ---- Embed builders ----
+
+function buildTicketPanelEmbed(caption) {
+  return new EmbedBuilder()
+    .setTitle('Support Tickets')
+    .setDescription(caption)
+    .setColor(0x2B2D31)
+    .setFooter({ text: 'A private channel will be created for you and the support team only.' })
+    .setTimestamp();
 }
 
 // ---- Slash command handler (/setticket) ----
@@ -207,7 +288,6 @@ async function handleTicketCommand(interaction) {
     await interaction.deferReply();
 
     try {
-      // Only revoke SendMessages from the ticket creator — staff roles are untouched
       await interaction.channel.permissionOverwrites.edit(ticket.creatorId, {
         ViewChannel: true,
         SendMessages: false,
@@ -233,20 +313,18 @@ async function handleTicketCommand(interaction) {
       new ButtonBuilder()
         .setCustomId(`ticket_reopen_${channelId}`)
         .setLabel('Reopen')
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('🔓'),
+        .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId(`ticket_transcript_delete_${channelId}`)
         .setLabel('Save Transcript & Delete')
         .setStyle(ButtonStyle.Danger)
-        .setEmoji('📋')
     );
 
     await interaction.editReply({ embeds: [closeEmbed], components: [row] });
     return;
   }
 
-  // /ticket transcript — save transcript to log channel then delete
+  // /ticket transcript — save transcript embeds to log channel then delete
   if (subcommand === 'transcript') {
     if (!isStaff) {
       await interaction.reply({ content: 'You need the **Manage Server** permission to save transcripts.', ephemeral: false });
@@ -256,13 +334,13 @@ async function handleTicketCommand(interaction) {
     await interaction.deferReply();
 
     try {
-      const transcriptChan = await postTranscript(interaction.guild, interaction.channel, ticket, interaction.user.id);
+      const transcriptChan = await postTranscript(interaction.guild, interaction.channel, ticket, interaction.member);
       await ActiveTicketModel.findOneAndUpdate({ channelId }, { transcriptSaved: true });
 
       if (transcriptChan) {
-        await interaction.editReply({ content: `Transcript saved to ${transcriptChan}. Deleting channel in 5 seconds…` });
+        await interaction.editReply({ content: `Transcript saved to ${transcriptChan}. Deleting channel in 5 seconds...` });
       } else {
-        await interaction.editReply({ content: `Transcript saved (tip: configure a transcript log channel via \`/setticket\` to log these automatically). Deleting channel in 5 seconds…` });
+        await interaction.editReply({ content: `Transcript saved. Note: configure a transcript log channel via \`/setticket\` to have these posted automatically. Deleting channel in 5 seconds...` });
       }
 
       await new Promise(r => setTimeout(r, 5000));
@@ -292,7 +370,7 @@ async function handleTicketCommand(interaction) {
           const transcriptChan = interaction.guild.channels.cache.get(transcriptChannelId);
           if (transcriptChan) {
             const warnEmbed = new EmbedBuilder()
-              .setTitle('⚠️ Ticket Deleted Without Transcript')
+              .setTitle('Ticket Deleted Without Transcript')
               .setDescription(
                 `A ticket was deleted without saving a transcript.\n\n` +
                 `**Channel:** #${interaction.channel.name}\n` +
@@ -307,7 +385,7 @@ async function handleTicketCommand(interaction) {
         }
       }
 
-      await interaction.editReply({ content: 'Deleting ticket channel…' });
+      await interaction.editReply({ content: 'Deleting ticket channel...' });
       await ActiveTicketModel.deleteOne({ channelId }).catch(() => {});
       await interaction.channel.delete('Ticket forcefully deleted').catch(() => {});
     } catch (e) {
@@ -460,7 +538,7 @@ async function handleTicketInteraction(interaction) {
       .setDescription(
         'Support roles saved.\n\n' +
         'Finally, select a **staff-only channel** where ticket transcripts will be posted when a ticket is closed.\n\n' +
-        'This gives your team a permanent record of every case for accountability and future review.'
+        'Staff will be able to browse through each transcript page by page directly in Discord.'
       )
       .setColor(0x5865F2)
       .setFooter({ text: 'Step 4 of 4 — Select transcript log channel' });
@@ -661,7 +739,7 @@ async function handleTicketInteraction(interaction) {
     return true;
   }
 
-  // Reopen button (from close embed)
+  // Reopen button
   if (interaction.isButton() && customId.startsWith('ticket_reopen_')) {
     if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       await interaction.reply({ content: 'You need the **Manage Server** permission to reopen tickets.', ephemeral: false });
@@ -675,7 +753,6 @@ async function handleTicketInteraction(interaction) {
       return true;
     }
 
-    // Only restore the creator's SendMessages — staff was never touched
     await interaction.channel.permissionOverwrites.edit(ticket.creatorId, {
       ViewChannel: true,
       SendMessages: true,
@@ -685,14 +762,14 @@ async function handleTicketInteraction(interaction) {
     await ActiveTicketModel.findOneAndUpdate({ channelId }, { closed: false });
 
     const reopenEmbed = new EmbedBuilder()
-      .setDescription(`🔓 Ticket reopened by ${interaction.user}. The member can send messages again.`)
+      .setDescription(`Ticket reopened by ${interaction.user}. The member can send messages again.`)
       .setColor(0x57F287);
 
     await interaction.update({ embeds: [reopenEmbed], components: [] });
     return true;
   }
 
-  // Save Transcript & Delete button (from close embed)
+  // Save Transcript & Delete button
   if (interaction.isButton() && customId.startsWith('ticket_transcript_delete_')) {
     if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       await interaction.reply({ content: 'You need the **Manage Server** permission to save transcripts.', ephemeral: false });
@@ -709,11 +786,11 @@ async function handleTicketInteraction(interaction) {
     await interaction.deferUpdate();
 
     try {
-      const transcriptChan = await postTranscript(interaction.guild, interaction.channel, ticket, interaction.user.id);
+      const transcriptChan = await postTranscript(interaction.guild, interaction.channel, ticket, interaction.member);
       await ActiveTicketModel.findOneAndUpdate({ channelId }, { transcriptSaved: true });
 
       const savedEmbed = new EmbedBuilder()
-        .setDescription(`📋 Transcript saved${transcriptChan ? ` in ${transcriptChan}` : ''}. Deleting channel in 5 seconds…`)
+        .setDescription(`Transcript saved${transcriptChan ? ` in ${transcriptChan}` : ''}. Deleting channel in 5 seconds...`)
         .setColor(0x5865F2);
 
       await interaction.editReply({ embeds: [savedEmbed], components: [] });
@@ -724,6 +801,46 @@ async function handleTicketInteraction(interaction) {
       console.error('Transcript+delete error:', e);
       await interaction.editReply({ content: `Failed to save transcript: ${e.message}` }).catch(() => {});
     }
+    return true;
+  }
+
+  // Transcript page navigation — previous
+  if (interaction.isButton() && customId.startsWith('ticket_tr_prev_')) {
+    const rest = customId.replace('ticket_tr_prev_', '');
+    const lastUnderscore = rest.lastIndexOf('_');
+    const transcriptId = rest.slice(0, lastUnderscore);
+    const currentPage = parseInt(rest.slice(lastUnderscore + 1), 10);
+
+    const transcript = await TranscriptModel.findById(transcriptId);
+    if (!transcript) {
+      await interaction.reply({ content: 'Transcript not found.', ephemeral: false });
+      return true;
+    }
+
+    const newPage = Math.max(0, currentPage - 1);
+    const embed = buildTranscriptEmbed(transcript, newPage);
+    const components = buildTranscriptNav(transcriptId, newPage, transcript.pages.length);
+    await interaction.update({ embeds: [embed], components });
+    return true;
+  }
+
+  // Transcript page navigation — next
+  if (interaction.isButton() && customId.startsWith('ticket_tr_next_')) {
+    const rest = customId.replace('ticket_tr_next_', '');
+    const lastUnderscore = rest.lastIndexOf('_');
+    const transcriptId = rest.slice(0, lastUnderscore);
+    const currentPage = parseInt(rest.slice(lastUnderscore + 1), 10);
+
+    const transcript = await TranscriptModel.findById(transcriptId);
+    if (!transcript) {
+      await interaction.reply({ content: 'Transcript not found.', ephemeral: false });
+      return true;
+    }
+
+    const newPage = Math.min(transcript.pages.length - 1, currentPage + 1);
+    const embed = buildTranscriptEmbed(transcript, newPage);
+    const components = buildTranscriptNav(transcriptId, newPage, transcript.pages.length);
+    await interaction.update({ embeds: [embed], components });
     return true;
   }
 
