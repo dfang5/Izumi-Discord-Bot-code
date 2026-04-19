@@ -83,6 +83,11 @@ const joinLog = new Map();
 const userFirstMessage = new Map();
 const advancedConfig = new Map(); // guildId -> Map<channelId, ChannelConfig>
 
+// Snipe caches — keyed by channelId, hold the most recent event per channel
+const snipeDeleteCache = new Map();   // channelId -> { author, content, attachments, deletedAt }
+const snipeEditCache = new Map();     // channelId -> { author, before, after, messageUrl, editedAt }
+const snipeReactionCache = new Map(); // channelId -> { user, emoji, messageContent, messageUrl, messageAuthorTag, removedAt }
+
 // Slash command definitions
 const commands = [
   new SlashCommandBuilder()
@@ -939,6 +944,108 @@ client.on('messageCreate', async message => {
       console.error('Error generating behaviour summary:', error);
       return message.reply('Error generating behaviour summary. Please try again.');
     }
+  }
+
+  // =dsnipe — show last deleted message in this channel
+  if (message.content.trim() === '=dsnipe') {
+    if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
+      return message.reply('You need the **Manage Messages** permission to use this command.');
+    }
+    const entry = snipeDeleteCache.get(message.channel.id);
+    if (!entry) {
+      return message.reply('There is nothing to snipe in this channel.');
+    }
+    const embed = new EmbedBuilder()
+      .setTitle('Message Deleted')
+      .setColor(0xFF0000)
+      .addFields(
+        { name: 'Author', value: `${entry.author.tag} (${entry.author.id})`, inline: true },
+        { name: 'Channel', value: `${message.channel}`, inline: true },
+        { name: 'Deleted At', value: `<t:${Math.floor(entry.deletedAt / 1000)}:F>`, inline: true }
+      )
+      .setTimestamp();
+    if (entry.content) {
+      embed.addFields({
+        name: 'Content',
+        value: entry.content.length > 1024 ? `${entry.content.substring(0, 1021)}...` : entry.content,
+        inline: false
+      });
+    }
+    if (entry.attachments.length > 0) {
+      const list = entry.attachments.map(a => `[${a.name}](${a.url})`).join('\n');
+      embed.addFields({
+        name: 'Attachments',
+        value: list.length > 1024 ? `${list.substring(0, 1021)}...` : list,
+        inline: false
+      });
+    }
+    embed.setFooter({ text: `Sniped by ${message.author.tag}` });
+    return message.reply({ embeds: [embed] });
+  }
+
+  // =esnipe — show last edited message in this channel
+  if (message.content.trim() === '=esnipe') {
+    if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
+      return message.reply('You need the **Manage Messages** permission to use this command.');
+    }
+    const entry = snipeEditCache.get(message.channel.id);
+    if (!entry) {
+      return message.reply('There is nothing to snipe in this channel.');
+    }
+    const embed = new EmbedBuilder()
+      .setTitle('Message Edited')
+      .setColor(0xFFA500)
+      .addFields(
+        { name: 'Author', value: `${entry.author.tag} (${entry.author.id})`, inline: true },
+        { name: 'Channel', value: `${message.channel}`, inline: true },
+        { name: 'Edited At', value: `<t:${Math.floor(entry.editedAt / 1000)}:F>`, inline: true }
+      )
+      .setTimestamp();
+    if (entry.before) {
+      embed.addFields({
+        name: 'Before',
+        value: entry.before.length > 512 ? `${entry.before.substring(0, 509)}...` : entry.before,
+        inline: false
+      });
+    }
+    if (entry.after) {
+      embed.addFields({
+        name: 'After',
+        value: entry.after.length > 512 ? `${entry.after.substring(0, 509)}...` : entry.after,
+        inline: false
+      });
+    }
+    embed.addFields({ name: 'Jump to Message', value: `[Click here](${entry.messageUrl})`, inline: true });
+    embed.setFooter({ text: `Sniped by ${message.author.tag}` });
+    return message.reply({ embeds: [embed] });
+  }
+
+  // =rsnipe — show last removed reaction in this channel
+  if (message.content.trim() === '=rsnipe') {
+    if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
+      return message.reply('You need the **Manage Messages** permission to use this command.');
+    }
+    const entry = snipeReactionCache.get(message.channel.id);
+    if (!entry) {
+      return message.reply('There is nothing to snipe in this channel.');
+    }
+    const embed = new EmbedBuilder()
+      .setTitle('Reaction Removed')
+      .setColor(0xFF4444)
+      .addFields(
+        { name: 'User', value: `${entry.user.tag} (${entry.user.id})`, inline: true },
+        { name: 'Channel', value: `${message.channel}`, inline: true },
+        { name: 'Removed At', value: `<t:${Math.floor(entry.removedAt / 1000)}:F>`, inline: true },
+        { name: 'Reaction', value: `${entry.emoji}`, inline: true },
+        { name: 'Message', value: `[Jump to message](${entry.messageUrl})`, inline: true }
+      )
+      .setTimestamp();
+    if (entry.messageContent) {
+      const c = entry.messageContent.length > 200 ? `${entry.messageContent.substring(0, 197)}...` : entry.messageContent;
+      embed.addFields({ name: 'Message Content', value: c, inline: false });
+    }
+    embed.setFooter({ text: `Message author: ${entry.messageAuthorTag} | Sniped by ${message.author.tag}` });
+    return message.reply({ embeds: [embed] });
   }
 
   if (!message.content.startsWith('!check')) return;
@@ -1908,6 +2015,16 @@ client.on('messageDelete', async message => {
   // Ignore bot messages and system messages
   if (!message.author || message.author.bot || message.system) return;
 
+  // Populate =dsnipe cache
+  if (message.guild) {
+    snipeDeleteCache.set(message.channel.id, {
+      author: message.author,
+      content: message.content || '',
+      attachments: [...message.attachments.values()],
+      deletedAt: Date.now()
+    });
+  }
+
   const config = getServerConfig(message.guild.id);
   if (!config.deletedLogsChannel) return;
 
@@ -1955,6 +2072,17 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
   // Ignore bot messages, system messages, and messages without content changes
   if (!newMessage.author || newMessage.author.bot || newMessage.system) return;
   if (oldMessage.content === newMessage.content) return; // No content change
+
+  // Populate =esnipe cache
+  if (newMessage.guild) {
+    snipeEditCache.set(newMessage.channel.id, {
+      author: newMessage.author,
+      before: oldMessage.content || '',
+      after: newMessage.content || '',
+      messageUrl: newMessage.url,
+      editedAt: Date.now()
+    });
+  }
 
   const config = getServerConfig(newMessage.guild.id);
   if (!config.editLogsChannel) return;
@@ -2068,6 +2196,18 @@ client.on('messageReactionRemove', async (reaction, user) => {
       console.error('Error fetching reaction:', error);
       return;
     }
+  }
+
+  // Populate =rsnipe cache
+  if (reaction.message.guild) {
+    snipeReactionCache.set(reaction.message.channel.id, {
+      user,
+      emoji: reaction.emoji.toString(),
+      messageContent: reaction.message.content || '',
+      messageUrl: reaction.message.url,
+      messageAuthorTag: reaction.message.author?.tag || 'Unknown',
+      removedAt: Date.now()
+    });
   }
 
   const config = getServerConfig(reaction.message.guild.id);
