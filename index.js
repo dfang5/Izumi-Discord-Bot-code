@@ -325,6 +325,40 @@ async function checkAdvancedRestrictions(message) {
     }
   };
 
+  const sendAdvancedLog = async (reason) => {
+    const serverCfg = getServerConfig(message.guild.id);
+    if (!serverCfg.deletedLogsChannel) return;
+    const logChannel = message.guild.channels.cache.get(serverCfg.deletedLogsChannel);
+    if (!logChannel) return;
+    const logEmbed = new EmbedBuilder()
+      .setTitle('Message Deleted — Advanced Toggle')
+      .setColor(0x9B59B6)
+      .addFields(
+        { name: 'Author', value: `${message.author.tag} (${message.author.id})`, inline: true },
+        { name: 'Channel', value: `${message.channel}`, inline: true },
+        { name: 'Deleted At', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true },
+        { name: 'Reason', value: reason, inline: false }
+      )
+      .setTimestamp();
+    if (message.content) {
+      logEmbed.addFields({
+        name: 'Content',
+        value: message.content.length > 1024 ? `${message.content.substring(0, 1021)}...` : message.content,
+        inline: false
+      });
+    }
+    if (message.attachments.size > 0) {
+      const attachmentList = message.attachments.map(att => `[${att.name}](${att.url})`).join('\n');
+      logEmbed.addFields({
+        name: 'Attachments',
+        value: attachmentList.length > 1024 ? `${attachmentList.substring(0, 1021)}...` : attachmentList,
+        inline: false
+      });
+    }
+    logEmbed.setFooter({ text: `Message ID: ${message.id}` });
+    await logChannel.send({ embeds: [logEmbed] }).catch(() => {});
+  };
+
   if (channelCfg.mode === 'messages_only') {
     const hasMedia = message.attachments.some(a =>
       a.contentType?.startsWith('image/') || a.contentType?.startsWith('video/')
@@ -333,6 +367,7 @@ async function checkAdvancedRestrictions(message) {
     if (hasMedia) {
       const savedText = message.content?.trim() || '';
       await message.delete().catch(() => {});
+      await sendAdvancedLog('Channel is set to **Messages Only** — message contained media.');
       const response = await message.channel.send({
         content: `${member}, this channel is set to **text only**. Your message was removed because it contained media.\n\n` +
           (savedText
@@ -346,14 +381,17 @@ async function checkAdvancedRestrictions(message) {
 
   if (channelCfg.mode === 'media_only') {
     const hasText = message.content && message.content.trim().length > 0;
-    const hasMedia = message.attachments.some(a =>
+    const hasAttachment = message.attachments.some(a =>
       a.contentType?.startsWith('image/') || a.contentType?.startsWith('video/')
     );
+    const hasLink = /https?:\/\/[^\s]+/.test(message.content || '');
+    const hasMedia = hasAttachment || hasLink;
     if (hasText && !hasMedia) {
       await message.delete().catch(() => {});
+      await sendAdvancedLog('Channel is set to **Media Only** — message contained no media, attachment, or link.');
       const response = await message.channel.send({
         content: `${member}, this channel is set to **media only**. Your message was removed because it contained no media.\n\n` +
-          'Please include an image or video with your message.'
+          'Please include an image, video, or link with your message.'
       });
       scheduleDelete(response);
       return true;
