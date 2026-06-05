@@ -1358,20 +1358,20 @@ client.on('interactionCreate', async interaction => {
 
       // Resolve badges
       const flagMap = {
-        Staff:                    '🛠️ Discord Staff',
-        Partner:                  '🤝 Partnered Server Owner',
-        Hypesquad:                '🏠 HypeSquad Events',
-        BugHunterLevel1:          '🐛 Bug Hunter',
-        BugHunterLevel2:          '🏅 Bug Hunter Gold',
-        HypeSquadOnlineHouse1:    '🏡 HypeSquad Bravery',
-        HypeSquadOnlineHouse2:    '🏡 HypeSquad Brilliance',
-        HypeSquadOnlineHouse3:    '🏡 HypeSquad Balance',
-        PremiumEarlySupporter:    '⭐ Early Supporter',
-        TeamPseudoUser:           '👥 Team User',
-        VerifiedBot:              '✅ Verified Bot',
-        VerifiedDeveloper:        '🔨 Verified Bot Developer',
-        CertifiedModerator:       '🛡️ Certified Moderator',
-        ActiveDeveloper:          '👨‍💻 Active Developer',
+        Staff:                    'Discord Staff',
+        Partner:                  'Partnered Server Owner',
+        Hypesquad:                'HypeSquad Events',
+        BugHunterLevel1:          'Bug Hunter',
+        BugHunterLevel2:          'Bug Hunter Gold',
+        HypeSquadOnlineHouse1:    'HypeSquad Bravery',
+        HypeSquadOnlineHouse2:    'HypeSquad Brilliance',
+        HypeSquadOnlineHouse3:    'HypeSquad Balance',
+        PremiumEarlySupporter:    'Early Supporter',
+        TeamPseudoUser:           'Team User',
+        VerifiedBot:              'Verified Bot',
+        VerifiedDeveloper:        'Verified Bot Developer',
+        CertifiedModerator:       'Certified Moderator',
+        ActiveDeveloper:          'Active Developer',
       };
       const badges = target.flags
         ? target.flags.toArray().map(f => flagMap[f] || f).join('\n') || 'None'
@@ -1391,30 +1391,30 @@ client.on('interactionCreate', async interaction => {
       // Permission level in this server
       let permLevel = 'Not in server';
       if (member) {
-        if (member.permissions.has('Administrator')) permLevel = '🔴 Administrator';
-        else if (member.permissions.has('ManageGuild')) permLevel = '🟠 Manager';
-        else if (member.permissions.has('ModerateMembers')) permLevel = '🟡 Moderator';
-        else permLevel = '🟢 Member';
+        if (member.permissions.has('Administrator')) permLevel = 'Administrator';
+        else if (member.permissions.has('ManageGuild')) permLevel = 'Manager';
+        else if (member.permissions.has('ModerateMembers')) permLevel = 'Moderator';
+        else permLevel = 'Member';
       }
 
       const embed = new EmbedBuilder()
-        .setTitle(`🔍 User Profile: ${target.username}`)
+        .setTitle(`User Profile: ${target.username}`)
         .setDescription(
-          `${target.bot ? '🤖 **This account is a bot.**\n' : ''}` +
+          `${target.bot ? '**This account is a bot.**\n' : ''}` +
           `${target.globalName && target.globalName !== target.username ? `**Display Name:** ${target.globalName}\n` : ''}` +
           `**User Tag:** ${target.tag}`
         )
         .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 512 }))
         .setColor(embedColor)
         .addFields(
-          { name: '🪪 User ID', value: `\`${target.id}\``, inline: true },
-          { name: '📅 Account Created', value: `<t:${Math.floor(target.createdTimestamp / 1000)}:D>\n(<t:${Math.floor(target.createdTimestamp / 1000)}:R>)`, inline: true },
-          { name: '⏳ Account Age', value: `${accountAgeDays} days (${accountAgeYears} yrs)`, inline: true }
+          { name: 'User ID', value: `\`${target.id}\``, inline: true },
+          { name: 'Account Created', value: `<t:${Math.floor(target.createdTimestamp / 1000)}:D>\n(<t:${Math.floor(target.createdTimestamp / 1000)}:R>)`, inline: true },
+          { name: 'Account Age', value: `${accountAgeDays} days (${accountAgeYears} yrs)`, inline: true }
         )
         .addFields(
-          { name: '🏅 Badges', value: badges, inline: true },
-          { name: '💎 Nitro Signs', value: nitroSigns.length > 0 ? nitroSigns.join('\n') : 'None detected', inline: true },
-          { name: '⚠️ Risk Snapshot', value: `**${risk.label}** (${risk.score}/100)`, inline: true }
+          { name: 'Badges', value: badges, inline: true },
+          { name: 'Nitro Signs', value: nitroSigns.length > 0 ? nitroSigns.join('\n') : 'None detected', inline: true },
+          { name: 'Risk Snapshot', value: `**${risk.label}** (${risk.score}/100)`, inline: true }
         );
 
       if (member) {
@@ -1426,22 +1426,22 @@ client.on('interactionCreate', async interaction => {
           .join(' ') || 'None';
 
         embed.addFields(
-          { name: '📥 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>\n(<t:${Math.floor(member.joinedTimestamp / 1000)}:R>)`, inline: true },
-          { name: '🔐 Permission Level', value: permLevel, inline: true },
-          { name: '🔇 Timed Out', value: member.communicationDisabledUntil && member.communicationDisabledUntil > Date.now() ? `Until <t:${Math.floor(member.communicationDisabledUntil / 1000)}:R>` : 'No', inline: true },
-          { name: `🎭 Roles (${member.roles.cache.size - 1})`, value: roles, inline: false }
+          { name: 'Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>\n(<t:${Math.floor(member.joinedTimestamp / 1000)}:R>)`, inline: true },
+          { name: 'Permission Level', value: permLevel, inline: true },
+          { name: 'Timed Out', value: member.communicationDisabledUntil && member.communicationDisabledUntil > Date.now() ? `Until <t:${Math.floor(member.communicationDisabledUntil / 1000)}:R>` : 'No', inline: true },
+          { name: `Roles (${member.roles.cache.size - 1})`, value: roles, inline: false }
         );
 
         if (member.premiumSince) {
-          embed.addFields({ name: '🚀 Boosting Since', value: `<t:${Math.floor(member.premiumSinceTimestamp / 1000)}:D>`, inline: true });
+          embed.addFields({ name: 'Boosting Since', value: `<t:${Math.floor(member.premiumSinceTimestamp / 1000)}:D>`, inline: true });
         }
       } else {
-        embed.addFields({ name: '📡 Server Status', value: 'This user is **not** in this server.', inline: false });
+        embed.addFields({ name: 'Server Status', value: 'This user is **not** in this server.', inline: false });
       }
 
       if (target.banner) {
         embed.setImage(target.bannerURL({ dynamic: true, size: 1024 }));
-        embed.addFields({ name: '🖼️ Profile Banner', value: 'Shown below', inline: true });
+        embed.addFields({ name: 'Profile Banner', value: 'Shown below', inline: true });
       }
 
       embed.setFooter({ text: `Searched by ${interaction.user.tag}  •  User ID: ${target.id}` }).setTimestamp();
