@@ -238,7 +238,15 @@ const commands = [
     .addSubcommand(sub =>
       sub.setName('unlock').setDescription('Allow members to send messages in this ticket again'))
     .addSubcommand(sub =>
-      sub.setName('roles').setDescription('Update which roles have access to this ticket'))
+      sub.setName('roles').setDescription('Update which roles have access to this ticket')),
+
+  new SlashCommandBuilder()
+    .setName('searchuser')
+    .setDescription('Look up a detailed profile for any Discord user by their ID')
+    .addStringOption(option =>
+      option.setName('userid')
+        .setDescription('The Discord user ID to search')
+        .setRequired(true)),
 ];
 
 // Helper functions for permissions
@@ -1328,6 +1336,136 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ embeds: [embed] });
     }
 
+    if (commandName === 'searchuser') {
+      const rawId = interaction.options.getString('userid').trim();
+
+      if (!/^\d{17,20}$/.test(rawId)) {
+        return interaction.reply({ content: 'That doesn\'t look like a valid Discord user ID. IDs are 17–20 digit numbers.', ephemeral: true });
+      }
+
+      await interaction.deferReply();
+
+      let target;
+      try {
+        target = await client.users.fetch(rawId, { force: true });
+      } catch {
+        return interaction.editReply({ content: `No user found with ID \`${rawId}\`. They may not exist or the ID is incorrect.` });
+      }
+
+      const member = await interaction.guild.members.fetch(rawId).catch(() => null);
+      const accountAgeDays = Math.floor((Date.now() - target.createdTimestamp) / (1000 * 60 * 60 * 24));
+      const accountAgeYears = (accountAgeDays / 365).toFixed(1);
+
+      // Resolve badges
+      const flagMap = {
+        Staff:                    '🛠️ Discord Staff',
+        Partner:                  '🤝 Partnered Server Owner',
+        Hypesquad:                '🏠 HypeSquad Events',
+        BugHunterLevel1:          '🐛 Bug Hunter',
+        BugHunterLevel2:          '🏅 Bug Hunter Gold',
+        HypeSquadOnlineHouse1:    '🏡 HypeSquad Bravery',
+        HypeSquadOnlineHouse2:    '🏡 HypeSquad Brilliance',
+        HypeSquadOnlineHouse3:    '🏡 HypeSquad Balance',
+        PremiumEarlySupporter:    '⭐ Early Supporter',
+        TeamPseudoUser:           '👥 Team User',
+        VerifiedBot:              '✅ Verified Bot',
+        VerifiedDeveloper:        '🔨 Verified Bot Developer',
+        CertifiedModerator:       '🛡️ Certified Moderator',
+        ActiveDeveloper:          '👨‍💻 Active Developer',
+      };
+      const badges = target.flags
+        ? target.flags.toArray().map(f => flagMap[f] || f).join('\n') || 'None'
+        : 'None';
+
+      // Nitro indicators
+      const nitroSigns = [];
+      if (target.avatar?.startsWith('a_')) nitroSigns.push('Animated avatar');
+      if (target.banner) nitroSigns.push('Custom profile banner');
+      if (member?.premiumSince) nitroSigns.push('Active server booster');
+
+      // Quick risk snapshot
+      const risk = await calculateRisk(target, interaction.guild);
+      const riskColors = { Critical: 0x8B0000, High: 0xFF0000, Medium: 0xFFA500, Low: 0xFFFF00, Minimal: 0x00FF00 };
+      const embedColor = riskColors[risk.label] || 0x5865F2;
+
+      // Permission level in this server
+      let permLevel = 'Not in server';
+      if (member) {
+        if (member.permissions.has('Administrator')) permLevel = '🔴 Administrator';
+        else if (member.permissions.has('ManageGuild')) permLevel = '🟠 Manager';
+        else if (member.permissions.has('ModerateMembers')) permLevel = '🟡 Moderator';
+        else permLevel = '🟢 Member';
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle(`🔍 User Profile: ${target.username}`)
+        .setDescription(
+          `${target.bot ? '🤖 **This account is a bot.**\n' : ''}` +
+          `${target.globalName && target.globalName !== target.username ? `**Display Name:** ${target.globalName}\n` : ''}` +
+          `**User Tag:** ${target.tag}`
+        )
+        .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 512 }))
+        .setColor(embedColor)
+        .addFields(
+          { name: '🪪 User ID', value: `\`${target.id}\``, inline: true },
+          { name: '📅 Account Created', value: `<t:${Math.floor(target.createdTimestamp / 1000)}:D>\n(<t:${Math.floor(target.createdTimestamp / 1000)}:R>)`, inline: true },
+          { name: '⏳ Account Age', value: `${accountAgeDays} days (${accountAgeYears} yrs)`, inline: true }
+        )
+        .addFields(
+          { name: '🏅 Badges', value: badges, inline: true },
+          { name: '💎 Nitro Signs', value: nitroSigns.length > 0 ? nitroSigns.join('\n') : 'None detected', inline: true },
+          { name: '⚠️ Risk Snapshot', value: `**${risk.label}** (${risk.score}/100)`, inline: true }
+        );
+
+      if (member) {
+        const roles = member.roles.cache
+          .filter(r => r.id !== interaction.guild.id)
+          .sort((a, b) => b.position - a.position)
+          .map(r => `<@&${r.id}>`)
+          .slice(0, 10)
+          .join(' ') || 'None';
+
+        embed.addFields(
+          { name: '📥 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>\n(<t:${Math.floor(member.joinedTimestamp / 1000)}:R>)`, inline: true },
+          { name: '🔐 Permission Level', value: permLevel, inline: true },
+          { name: '🔇 Timed Out', value: member.communicationDisabledUntil && member.communicationDisabledUntil > Date.now() ? `Until <t:${Math.floor(member.communicationDisabledUntil / 1000)}:R>` : 'No', inline: true },
+          { name: `🎭 Roles (${member.roles.cache.size - 1})`, value: roles, inline: false }
+        );
+
+        if (member.premiumSince) {
+          embed.addFields({ name: '🚀 Boosting Since', value: `<t:${Math.floor(member.premiumSinceTimestamp / 1000)}:D>`, inline: true });
+        }
+      } else {
+        embed.addFields({ name: '📡 Server Status', value: 'This user is **not** in this server.', inline: false });
+      }
+
+      if (target.banner) {
+        embed.setImage(target.bannerURL({ dynamic: true, size: 1024 }));
+        embed.addFields({ name: '🖼️ Profile Banner', value: 'Shown below', inline: true });
+      }
+
+      embed.setFooter({ text: `Searched by ${interaction.user.tag}  •  User ID: ${target.id}` }).setTimestamp();
+
+      const buttons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`check_from_search_${target.id}`)
+          .setLabel('Run Full Risk Check')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setLabel('Open Avatar')
+          .setStyle(ButtonStyle.Link)
+          .setURL(target.displayAvatarURL({ dynamic: true, size: 1024 })),
+        ...(target.banner ? [
+          new ButtonBuilder()
+            .setLabel('Open Banner')
+            .setStyle(ButtonStyle.Link)
+            .setURL(target.bannerURL({ dynamic: true, size: 1024 }))
+        ] : [])
+      );
+
+      return interaction.editReply({ embeds: [embed], components: [buttons] });
+    }
+
     if (commandName === 'althistory') {
       if (!isModerator(interaction.member)) {
         return interaction.reply({ content: 'You need moderator permissions to use this command.', ephemeral: false });
@@ -1948,6 +2086,36 @@ client.on('interactionCreate', async interaction => {
     );
 
     return interaction.update({ embeds: [embed], components: [row] });
+  }
+
+  if (interaction.customId.startsWith('check_from_search_')) {
+    if (!isModerator(interaction.member)) {
+      return interaction.reply({ content: 'You need moderator permissions to run a risk check.', ephemeral: true });
+    }
+    const targetId = interaction.customId.replace('check_from_search_', '');
+    await interaction.deferReply();
+    const target = await client.users.fetch(targetId, { force: true }).catch(() => null);
+    if (!target) return interaction.editReply({ content: 'Could not fetch this user.' });
+    const risk = await calculateRisk(target, interaction.guild);
+    const mutualAnalysis = await analyzeMutualConnections(target, interaction.user, client);
+    risk.mutualAnalysis = mutualAnalysis;
+    if (mutualAnalysis.hasCloseTimingPattern) { risk.score += 25; risk.factors.push('Suspicious mutual server timing patterns'); }
+    if (mutualAnalysis.mutualCount === 0) { risk.score += 5; risk.factors.push('No detectable mutual servers'); }
+    risk.score = Math.max(0, Math.min(100, risk.score));
+    if (risk.score >= 80) risk.label = 'Critical';
+    else if (risk.score >= 60) risk.label = 'High';
+    else if (risk.score >= 35) risk.label = 'Medium';
+    else if (risk.score >= 15) risk.label = 'Low';
+    else risk.label = 'Minimal';
+    const embed = await makeCheckEmbed(target, risk, interaction.guild);
+    const targetMember = await interaction.guild.members.fetch(targetId).catch(() => null);
+    const isTargetAdmin = targetMember && isAdmin(targetMember);
+    const buttons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`allow_${targetId}`).setLabel('Allow').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`kick_${targetId}`).setLabel(isTargetAdmin ? 'Kick (Admin Immune)' : 'Kick').setStyle(ButtonStyle.Danger).setDisabled(isTargetAdmin),
+      new ButtonBuilder().setCustomId(`ban_${targetId}`).setLabel(isTargetAdmin ? 'Ban (Admin Immune)' : 'Ban').setStyle(ButtonStyle.Danger).setDisabled(isTargetAdmin)
+    );
+    return interaction.editReply({ embeds: [embed], components: [buttons] });
   }
 
   const [action, userId] = interaction.customId.split('_');
