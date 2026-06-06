@@ -15,6 +15,7 @@ const ServerConfigSchema = new mongoose.Schema({
   reactionLogsChannel: { type: String, default: null },
   deletedLogsChannel: { type: String, default: null },
   editLogsChannel: { type: String, default: null },
+  modLogsChannel: { type: String, default: null },
   warnDeleteTimeout: { type: Number, default: 60 },
   quarantine: {
     enabled: { type: Boolean, default: false },
@@ -247,6 +248,84 @@ const commands = [
       option.setName('userid')
         .setDescription('The Discord user ID to search')
         .setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('setmodlogs')
+    .setDescription('Configure the mod action logs channel (Admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('unban')
+    .setDescription('Unban a user from the server by their ID')
+    .addStringOption(option =>
+      option.setName('userid')
+        .setDescription('The ID of the user to unban')
+        .setRequired(true))
+    .addStringOption(option =>
+      option.setName('reason')
+        .setDescription('Reason for the unban')
+        .setRequired(false))
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+
+  new SlashCommandBuilder()
+    .setName('kick')
+    .setDescription('Kick a member from the server')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The member to kick')
+        .setRequired(true))
+    .addStringOption(option =>
+      option.setName('reason')
+        .setDescription('Reason for the kick')
+        .setRequired(false))
+    .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
+
+  new SlashCommandBuilder()
+    .setName('ban')
+    .setDescription('Ban a member from the server')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The member to ban')
+        .setRequired(true))
+    .addStringOption(option =>
+      option.setName('reason')
+        .setDescription('Reason for the ban')
+        .setRequired(false))
+    .addIntegerOption(option =>
+      option.setName('delete_days')
+        .setDescription('Number of days of messages to delete (0–7)')
+        .setMinValue(0)
+        .setMaxValue(7)
+        .setRequired(false))
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+
+  new SlashCommandBuilder()
+    .setName('timeout')
+    .setDescription('Timeout a member, preventing them from sending messages')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The member to timeout')
+        .setRequired(true))
+    .addStringOption(option =>
+      option.setName('duration')
+        .setDescription('How long to timeout the member')
+        .setRequired(true)
+        .addChoices(
+          { name: '60 seconds', value: '60' },
+          { name: '5 minutes',  value: '300' },
+          { name: '10 minutes', value: '600' },
+          { name: '30 minutes', value: '1800' },
+          { name: '1 hour',     value: '3600' },
+          { name: '6 hours',    value: '21600' },
+          { name: '12 hours',   value: '43200' },
+          { name: '1 day',      value: '86400' },
+          { name: '1 week',     value: '604800' }
+        ))
+    .addStringOption(option =>
+      option.setName('reason')
+        .setDescription('Reason for the timeout')
+        .setRequired(false))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 ];
 
 // Helper functions for permissions
@@ -265,6 +344,7 @@ function getServerConfig(guildId) {
       reactionLogsChannel: null,
       deletedLogsChannel: null,
       editLogsChannel: null,
+      modLogsChannel: null,
       warnDeleteTimeout: 60,
       quarantine: {
         enabled: false,
@@ -557,6 +637,7 @@ async function loadAllConfigs() {
         reactionLogsChannel: doc.reactionLogsChannel ?? null,
         deletedLogsChannel: doc.deletedLogsChannel ?? null,
         editLogsChannel: doc.editLogsChannel ?? null,
+        modLogsChannel: doc.modLogsChannel ?? null,
         warnDeleteTimeout: doc.warnDeleteTimeout !== undefined ? doc.warnDeleteTimeout : 60,
         quarantine: {
           enabled: doc.quarantine?.enabled ?? false,
@@ -783,6 +864,14 @@ async function quarantineUser(member, reason, moderator = null) {
 }
 
 // Helper function to create channel selection menu
+async function sendModLog(guild, embed) {
+  const config = getServerConfig(guild.id);
+  if (!config.modLogsChannel) return;
+  const logChannel = guild.channels.cache.get(config.modLogsChannel);
+  if (!logChannel) return;
+  await logChannel.send({ embeds: [embed] }).catch(() => {});
+}
+
 function createChannelSelectMenu(guildId, logType) {
   const guild = client.guilds.cache.get(guildId);
   const textChannels = guild.channels.cache
@@ -1466,6 +1555,99 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply({ embeds: [embed], components: [buttons] });
     }
 
+    if (commandName === 'kick') {
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+
+      if (!member) return interaction.reply({ content: 'That user is not in this server.', ephemeral: true });
+      if (isAdmin(member)) return interaction.reply({ content: 'That member has administrator privileges and cannot be kicked.', ephemeral: true });
+      if (!member.kickable) return interaction.reply({ content: 'I do not have permission to kick that member. Check my role position.', ephemeral: true });
+
+      await member.kick(reason);
+      const kickEmbed = new EmbedBuilder()
+        .setTitle('Member Kicked')
+        .setColor(0xFF6B35)
+        .addFields(
+          { name: 'Member', value: `${target.tag} (${target.id})`, inline: true },
+          { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+          { name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true },
+          { name: 'Reason', value: reason, inline: false }
+        )
+        .setThumbnail(target.displayAvatarURL({ dynamic: true }))
+        .setTimestamp();
+      await sendModLog(interaction.guild, kickEmbed);
+      return interaction.reply({ embeds: [kickEmbed] });
+    }
+
+    if (commandName === 'ban') {
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+      const deleteDays = interaction.options.getInteger('delete_days') ?? 0;
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+
+      if (member) {
+        if (isAdmin(member)) return interaction.reply({ content: 'That member has administrator privileges and cannot be banned.', ephemeral: true });
+        if (!member.bannable) return interaction.reply({ content: 'I do not have permission to ban that member. Check my role position.', ephemeral: true });
+      }
+
+      await interaction.guild.bans.create(target.id, { reason, deleteMessageDays: deleteDays });
+      const banEmbed = new EmbedBuilder()
+        .setTitle('Member Banned')
+        .setColor(0xFF0000)
+        .addFields(
+          { name: 'Member', value: `${target.tag} (${target.id})`, inline: true },
+          { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+          { name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true },
+          { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true },
+          { name: 'Reason', value: reason, inline: false }
+        )
+        .setThumbnail(target.displayAvatarURL({ dynamic: true }))
+        .setTimestamp();
+      await sendModLog(interaction.guild, banEmbed);
+      return interaction.reply({ embeds: [banEmbed] });
+    }
+
+    if (commandName === 'timeout') {
+      const target = interaction.options.getUser('user');
+      const durationSeconds = parseInt(interaction.options.getString('duration'));
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+
+      if (!member) return interaction.reply({ content: 'That user is not in this server.', ephemeral: true });
+      if (isAdmin(member)) return interaction.reply({ content: 'That member has administrator privileges and cannot be timed out.', ephemeral: true });
+      if (!member.moderatable) return interaction.reply({ content: 'I do not have permission to timeout that member. Check my role position.', ephemeral: true });
+
+      const until = Date.now() + durationSeconds * 1000;
+      await member.timeout(durationSeconds * 1000, reason);
+
+      const durationLabel = durationSeconds === 60 ? '60 seconds'
+        : durationSeconds === 300 ? '5 minutes'
+        : durationSeconds === 600 ? '10 minutes'
+        : durationSeconds === 1800 ? '30 minutes'
+        : durationSeconds === 3600 ? '1 hour'
+        : durationSeconds === 21600 ? '6 hours'
+        : durationSeconds === 43200 ? '12 hours'
+        : durationSeconds === 86400 ? '1 day'
+        : '1 week';
+
+      const timeoutEmbed = new EmbedBuilder()
+        .setTitle('Member Timed Out')
+        .setColor(0xFFA500)
+        .addFields(
+          { name: 'Member', value: `${target.tag} (${target.id})`, inline: true },
+          { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+          { name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true },
+          { name: 'Duration', value: durationLabel, inline: true },
+          { name: 'Expires', value: `<t:${Math.floor(until / 1000)}:R>`, inline: true },
+          { name: 'Reason', value: reason, inline: false }
+        )
+        .setThumbnail(target.displayAvatarURL({ dynamic: true }))
+        .setTimestamp();
+      await sendModLog(interaction.guild, timeoutEmbed);
+      return interaction.reply({ embeds: [timeoutEmbed] });
+    }
+
     if (commandName === 'althistory') {
       if (!isModerator(interaction.member)) {
         return interaction.reply({ content: 'You need moderator permissions to use this command.', ephemeral: false });
@@ -1486,6 +1668,58 @@ client.on('interactionCreate', async interaction => {
         .setTimestamp();
 
       return interaction.reply({ embeds: [embed], ephemeral: false });
+    }
+
+    if (commandName === 'setmodlogs') {
+      if (!isAdmin(interaction.member)) {
+        return interaction.reply({ content: 'You need administrator permissions to configure logging.', ephemeral: false });
+      }
+
+      const selectMenu = createChannelSelectMenu(interaction.guild.id, 'mod');
+      const row = new ActionRowBuilder().addComponents(selectMenu);
+
+      const embed = new EmbedBuilder()
+        .setTitle('Configure Mod Action Logs')
+        .setDescription('Select a channel where kick, ban, timeout, and unban actions will be logged.')
+        .setColor(0xFF6B35);
+
+      return interaction.reply({ embeds: [embed], components: [row], ephemeral: false });
+    }
+
+    if (commandName === 'unban') {
+      const rawId = interaction.options.getString('userid').trim();
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+
+      if (!/^\d{17,20}$/.test(rawId)) {
+        return interaction.reply({ content: 'That doesn\'t look like a valid user ID. IDs are 17–20 digit numbers.', ephemeral: true });
+      }
+
+      let target;
+      try {
+        target = await client.users.fetch(rawId);
+      } catch {
+        return interaction.reply({ content: `Could not find a user with ID \`${rawId}\`.`, ephemeral: true });
+      }
+
+      const banEntry = await interaction.guild.bans.fetch(rawId).catch(() => null);
+      if (!banEntry) {
+        return interaction.reply({ content: `${target.tag} is not currently banned from this server.`, ephemeral: true });
+      }
+
+      await interaction.guild.bans.remove(rawId, reason);
+      const unbanEmbed = new EmbedBuilder()
+        .setTitle('Member Unbanned')
+        .setColor(0x00C853)
+        .addFields(
+          { name: 'Member', value: `${target.tag} (${target.id})`, inline: true },
+          { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+          { name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true },
+          { name: 'Reason', value: reason, inline: false }
+        )
+        .setThumbnail(target.displayAvatarURL({ dynamic: true }))
+        .setTimestamp();
+      await sendModLog(interaction.guild, unbanEmbed);
+      return interaction.reply({ embeds: [unbanEmbed] });
     }
 
     if (commandName === 'setreactionlogs') {
@@ -1559,6 +1793,11 @@ client.on('interactionCreate', async interaction => {
             name: ' Edit Message Logs', 
             value: config.editLogsChannel ? `<#${config.editLogsChannel}>` : 'Not configured', 
             inline: true 
+          },
+          {
+            name: 'Mod Action Logs',
+            value: config.modLogsChannel ? `<#${config.modLogsChannel}>` : 'Not configured',
+            inline: true
           }
         )
         .setColor(0x5865F2)
@@ -1906,6 +2145,11 @@ client.on('interactionCreate', async interaction => {
         serverConfigs.set(guildId, config);
         saveServerConfig(guildId).catch(console.error);
         return interaction.update({ content: `Message edit logs configured for ${channel}`, embeds: [], components: [] });
+      } else if (logType === 'mod') {
+        config.modLogsChannel = channelId;
+        serverConfigs.set(guildId, config);
+        saveServerConfig(guildId).catch(console.error);
+        return interaction.update({ content: `Mod action logs configured for ${channel}`, embeds: [], components: [] });
       }
     }
   }
