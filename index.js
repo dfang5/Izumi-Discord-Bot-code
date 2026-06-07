@@ -1023,10 +1023,36 @@ client.on('messageCreate', async message => {
 
       if (status === 'online' || status === 'idle') return;
 
-      let statusText = `is currently **${status}**`;
-      if (status === 'dnd') statusText = 'is in **Do Not Disturb** mode';
+      const offlineReplies = [
+        `Hm? My owner is currently offline — they'll get back to you when they're around.`,
+        `My owner's gone dark. No ETA on when they'll resurface.`,
+        `Offline. Whatever you need, it's going to have to wait.`,
+        `My owner isn't here right now. Leave a message and maybe they'll see it eventually.`,
+        `They're offline. I'd pass the message along, but I'm a bot, not a secretary.`,
+        `Not here. Try again later, or just... wait. Waiting works too.`,
+        `My owner has logged off from reality for the time being.`,
+        `Offline. Whether they'll be back soon is anyone's guess, honestly.`,
+        `Can't reach them right now. They're somewhere without a screen, presumably.`,
+        `My owner is offline. Your ping has been noted and will be ignored until further notice.`,
+      ];
 
-      await message.reply(`Nya? My master ${statusText}!`).catch(console.error);
+      const dndReplies = [
+        `Do Not Disturb. The name kind of says it all, doesn't it?`,
+        `My owner is on Do Not Disturb. Whatever it is, it can wait.`,
+        `DND is on. They've seen enough for now.`,
+        `My owner would like to not be disturbed. Please respect that.`,
+        `Do Not Disturb mode. They're busy, or just need a break. Either way, not now.`,
+        `They set that status for a reason. Try again later.`,
+        `DND. They know you're there. They're just choosing not to engage right now.`,
+        `My owner is in Do Not Disturb. Even I'm not interrupting them.`,
+        `Not available. The DND status wasn't decorative.`,
+        `Do Not Disturb means exactly that. They'll come back when they're ready.`,
+      ];
+
+      const pool = status === 'dnd' ? dndReplies : offlineReplies;
+      const reply = pool[Math.floor(Math.random() * pool.length)];
+
+      await message.reply(reply).catch(console.error);
     } catch (err) {
       console.error('Error in owner mention reply:', err);
     }
