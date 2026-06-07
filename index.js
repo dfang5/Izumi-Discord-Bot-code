@@ -1,4 +1,5 @@
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ChannelType, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, RoleSelectMenuBuilder, UserSelectMenuBuilder, ChannelSelectMenuBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ChannelType, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, RoleSelectMenuBuilder, UserSelectMenuBuilder, ChannelSelectMenuBuilder, AttachmentBuilder } = require('discord.js');
+const path = require('path');
 const { calculateRisk } = require('./risks');
 const { makeCheckEmbed } = require('./embeds');
 const {
@@ -195,20 +196,30 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
   new SlashCommandBuilder()
-    .setName('delete')
-    .setDescription('Moderation commands')
-    .addSubcommand(subcommand =>
-      subcommand
-        .setName('messages')
-        .setDescription('Delete all messages from a specific user in this channel')
-        .addUserOption(option => 
-          option.setName('user')
-            .setDescription('The user whose messages should be deleted')
-            .setRequired(false))
-        .addStringOption(option =>
-          option.setName('userid')
-            .setDescription('The user ID whose messages should be deleted')
-            .setRequired(false)))
+    .setName('purge')
+    .setDescription('Bulk delete messages from a channel or server-wide')
+    .addStringOption(option =>
+      option.setName('scope')
+        .setDescription('Where to delete messages')
+        .setRequired(true)
+        .addChoices(
+          { name: 'This channel only', value: 'channel' },
+          { name: 'Server-wide (all channels)', value: 'server' }
+        ))
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The user whose messages to delete (leave blank to delete all messages)')
+        .setRequired(false))
+    .addStringOption(option =>
+      option.setName('userid')
+        .setDescription('User ID whose messages to delete (alternative to selecting a user)')
+        .setRequired(false))
+    .addIntegerOption(option =>
+      option.setName('limit')
+        .setDescription('Max number of messages to delete (leave blank for all within Discord\'s 14-day window)')
+        .setMinValue(1)
+        .setMaxValue(5000)
+        .setRequired(false))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 
   new SlashCommandBuilder()
@@ -1342,63 +1353,138 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply({ embeds: [embed], components: [buttons] });
     }
 
-    if (commandName === 'delete') {
-      const subcommand = interaction.options.getSubcommand();
-      if (subcommand === 'messages') {
-        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
-          return interaction.reply({ content: 'You need Manage Messages permissions to use this command.', ephemeral: false });
+    if (commandName === 'purge') {
+      const scope = interaction.options.getString('scope');
+      const targetUser = interaction.options.getUser('user');
+      const targetIdRaw = interaction.options.getString('userid');
+      const hardLimit = interaction.options.getInteger('limit') ?? Infinity;
+
+      // Resolve target
+      let targetId = null;
+      let targetTag = null;
+      if (targetIdRaw) {
+        if (!/^\d{17,20}$/.test(targetIdRaw.trim())) {
+          return interaction.reply({ content: 'That doesn\'t look like a valid user ID.', ephemeral: true });
         }
-
-        const targetUser = interaction.options.getUser('user');
-        const targetId = interaction.options.getString('userid') || (targetUser ? targetUser.id : null);
-
-        if (!targetId) {
-          return interaction.reply({ content: 'Please provide either a user or a user ID.', ephemeral: false });
-        }
-
-        await interaction.deferReply({ ephemeral: false });
-
-        try {
-          let totalDeleted = 0;
-          let lastId = null;
-          let searching = true;
-
-          while (searching && totalDeleted < 500) { // Safety limit of 500 messages
-            const options = { limit: 100 };
-            if (lastId) options.before = lastId;
-
-            const fetchedMessages = await interaction.channel.messages.fetch(options);
-            if (fetchedMessages.size === 0) {
-              searching = false;
-              break;
-            }
-
-            const userMessages = fetchedMessages.filter(m => m.author.id === targetId);
-
-            if (userMessages.size > 0) {
-              const deleted = await interaction.channel.bulkDelete(userMessages, true);
-              totalDeleted += deleted.size;
-            }
-
-            lastId = fetchedMessages.last().id;
-
-            // Stop if we've reached messages older than 14 days (bulkDelete limit)
-            const oldestMessage = fetchedMessages.last();
-            if (Date.now() - oldestMessage.createdTimestamp > 14 * 24 * 60 * 60 * 1000) {
-              searching = false;
-            }
-          }
-
-          if (totalDeleted === 0) {
-            return interaction.editReply({ content: 'No deletable messages found from that user in this channel (messages must be under 14 days old).' });
-          }
-
-          return interaction.editReply({ content: `Successfully scoured the channel and deleted ${totalDeleted} messages from the specified user.` });
-        } catch (error) {
-          console.error('Error deleting messages:', error);
-          return interaction.editReply({ content: 'Failed to delete messages. They might be older than 14 days or I lack permissions.' });
-        }
+        targetId = targetIdRaw.trim();
+        try { const u = await client.users.fetch(targetId); targetTag = u.tag; }
+        catch { targetTag = `Unknown User (${targetId})`; }
+      } else if (targetUser) {
+        targetId = targetUser.id;
+        targetTag = targetUser.tag;
       }
+
+      await interaction.deferReply();
+
+      // Easter egg — GIF embed shown while working
+      const purgeGif = new AttachmentBuilder(path.join(__dirname, 'IMG_6957.gif'), { name: 'IMG_6957.gif' });
+      const workingEmbed = new EmbedBuilder()
+        .setTitle('Purging messages...')
+        .setDescription(targetId
+          ? `Scanning for messages sent by **${targetTag}**. This may take a moment.`
+          : 'Indiscriminate deletion in progress. Stand clear.')
+        .setImage('attachment://IMG_6957.gif')
+        .setColor(0xFF6B35)
+        .setFooter({ text: 'Izumi is on the case.' });
+
+      await interaction.editReply({ embeds: [workingEmbed], files: [purgeGif] });
+
+      const startTime = Date.now();
+      const twoWeeksAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
+      let totalDeleted = 0;
+      let totalSkipped = 0;
+      const channelsAffected = [];
+
+      const purgeChannel = async (channel) => {
+        let channelDeleted = 0;
+        let lastId = null;
+
+        while (totalDeleted + channelDeleted < hardLimit) {
+          const batchSize = Math.min(100, hardLimit - (totalDeleted + channelDeleted));
+          const fetchOptions = { limit: batchSize };
+          if (lastId) fetchOptions.before = lastId;
+
+          const fetched = await channel.messages.fetch(fetchOptions).catch(() => null);
+          if (!fetched || fetched.size === 0) break;
+
+          const candidates = targetId ? fetched.filter(m => m.author.id === targetId) : fetched;
+          const recent = candidates.filter(m => m.createdTimestamp > twoWeeksAgo);
+          totalSkipped += candidates.filter(m => m.createdTimestamp <= twoWeeksAgo).size;
+
+          if (recent.size > 0) {
+            const deleted = await channel.bulkDelete(recent, true).catch(() => ({ size: 0 }));
+            channelDeleted += deleted.size;
+          }
+
+          lastId = fetched.last().id;
+          if (fetched.last().createdTimestamp <= twoWeeksAgo) break;
+        }
+
+        if (channelDeleted > 0) channelsAffected.push({ channel, count: channelDeleted });
+        totalDeleted += channelDeleted;
+      };
+
+      try {
+        if (scope === 'channel') {
+          await purgeChannel(interaction.channel);
+        } else {
+          const botMember = interaction.guild.members.me;
+          const textChannels = interaction.guild.channels.cache.filter(c =>
+            c.type === ChannelType.GuildText &&
+            c.permissionsFor(botMember)?.has(PermissionFlagsBits.ManageMessages)
+          );
+          for (const [, ch] of textChannels) {
+            if (totalDeleted >= hardLimit) break;
+            await purgeChannel(ch);
+          }
+        }
+      } catch (err) {
+        console.error('Purge error:', err);
+      }
+
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      const completionEmbed = new EmbedBuilder()
+        .setTitle(`**${totalDeleted} message${totalDeleted !== 1 ? 's' : ''} successfully purged**`)
+        .setColor(totalDeleted > 0 ? 0x00C853 : 0xFFA500)
+        .addFields(
+          { name: 'Executed By', value: `${interaction.user.tag}\n(${interaction.user.id})`, inline: true },
+          { name: 'Scope', value: scope === 'channel' ? `<#${interaction.channel.id}>` : 'Server-wide', inline: true },
+          { name: 'Duration', value: `${duration}s`, inline: true },
+          { name: 'Started', value: `<t:${Math.floor(startTime / 1000)}:T>`, inline: true },
+          { name: 'Completed', value: `<t:${Math.floor(Date.now() / 1000)}:T>`, inline: true },
+          { name: 'Limit Applied', value: hardLimit === Infinity ? 'None (all available)' : `${hardLimit} messages`, inline: true }
+        );
+
+      if (targetId) {
+        completionEmbed.addFields({ name: 'Target', value: `${targetTag}\n(${targetId})`, inline: false });
+      } else {
+        completionEmbed.addFields({ name: 'Target', value: 'All users — indiscriminate deletion', inline: false });
+      }
+
+      if (scope === 'server' && channelsAffected.length > 0) {
+        const chList = channelsAffected.map(c => `<#${c.channel.id}> — ${c.count} deleted`).join('\n');
+        completionEmbed.addFields({
+          name: `Channels Affected (${channelsAffected.length})`,
+          value: chList.length > 1024 ? chList.substring(0, 1021) + '...' : chList,
+          inline: false
+        });
+      }
+
+      if (totalSkipped > 0) {
+        completionEmbed.addFields({
+          name: 'Skipped',
+          value: `${totalSkipped} message${totalSkipped !== 1 ? 's were' : ' was'} older than 14 days and cannot be bulk-deleted due to Discord's API limit.`,
+          inline: false
+        });
+      }
+
+      if (totalDeleted === 0) {
+        completionEmbed.setDescription('No deletable messages were found matching your criteria within Discord\'s 14-day window.');
+      }
+
+      completionEmbed.setTimestamp();
+      return interaction.editReply({ embeds: [completionEmbed] });
     }
 
     if (commandName === 'serverinfo') {
