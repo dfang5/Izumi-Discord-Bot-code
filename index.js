@@ -1922,7 +1922,6 @@ client.on('interactionCreate', async interaction => {
       const member = await interaction.guild.members.fetch(target.id).catch(() => null);
 
       if (!member) return interaction.reply({ content: 'That user is not in this server.', ephemeral: true });
-      if (isAdmin(member)) return interaction.reply({ content: 'You cannot warn an administrator.', ephemeral: true });
       if (target.id === interaction.user.id) return interaction.reply({ content: 'You cannot warn yourself.', ephemeral: true });
 
       await interaction.deferReply();
