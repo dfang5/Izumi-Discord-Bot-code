@@ -68,6 +68,30 @@ const QuarantinedUserSchema = new mongoose.Schema({
 QuarantinedUserSchema.index({ guildId: 1, userId: 1 }, { unique: true });
 const QuarantinedUserModel = mongoose.model('IzumiQuarantinedUser', QuarantinedUserSchema);
 
+const MemberTrustSchema = new mongoose.Schema({
+  guildId: { type: String, required: true },
+  userId: { type: String, required: true },
+  messageCount: { type: Number, default: 0 },
+  warningCount: { type: Number, default: 0 },
+  flagCount: { type: Number, default: 0 },
+  quarantineCount: { type: Number, default: 0 },
+  firstSeenAt: { type: Date, default: Date.now },
+  lastActiveAt: { type: Date, default: Date.now }
+});
+MemberTrustSchema.index({ guildId: 1, userId: 1 }, { unique: true });
+const MemberTrustModel = mongoose.model('IzumiMemberTrust', MemberTrustSchema);
+
+const WarnSchema = new mongoose.Schema({
+  guildId: { type: String, required: true },
+  userId: { type: String, required: true },
+  warnedBy: { type: String, required: true },
+  reason: { type: String, default: 'No reason provided' },
+  timestamp: { type: Date, default: Date.now },
+  warnId: { type: String, required: true, unique: true }
+});
+WarnSchema.index({ guildId: 1, userId: 1 });
+const WarnModel = mongoose.model('IzumiWarn', WarnSchema);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -89,6 +113,12 @@ const advancedConfig = new Map(); // guildId -> Map<channelId, ChannelConfig>
 const snipeDeleteCache = new Map();   // channelId -> { author, content, attachments, deletedAt }
 const snipeEditCache = new Map();     // channelId -> { author, before, after, messageUrl, editedAt }
 const snipeReactionCache = new Map(); // channelId -> { user, emoji, messageContent, messageUrl, messageAuthorTag, removedAt }
+
+// Suspicious mention velocity tracker
+// key: `${guildId}_${userId}` -> [{ mentionedId, timestamp }]
+const mentionTracker = new Map();
+const MENTION_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const MENTION_ALERT_THRESHOLD = 5;        // unique users mentioned before alert fires
 
 // Slash command definitions
 const commands = [
@@ -337,6 +367,55 @@ const commands = [
         .setDescription('Reason for the timeout')
         .setRequired(false))
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('trust')
+    .setDescription('Check the trust score of a server member')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The member to check')
+        .setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('warn')
+    .setDescription('Issue a warning to a server member')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The member to warn')
+        .setRequired(true))
+    .addStringOption(option =>
+      option.setName('reason')
+        .setDescription('Reason for the warning')
+        .setRequired(false))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('warnings')
+    .setDescription('View all warnings for a server member')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The member to look up')
+        .setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('clearwarn')
+    .setDescription('Remove a specific warning by its ID')
+    .addStringOption(option =>
+      option.setName('warnid')
+        .setDescription('The warning ID to remove')
+        .setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('clearwarnings')
+    .setDescription('Clear all warnings for a server member')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The member to clear')
+        .setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 ];
 
 // Helper functions for permissions
@@ -346,6 +425,61 @@ function isAdmin(member) {
 
 function isModerator(member) {
   return member.permissions.has('ModerateMembers') || member.permissions.has('BanMembers') || member.permissions.has('KickMembers') || isAdmin(member);
+}
+
+// Trust score calculator
+function calculateTrustScore(member, trustData) {
+  let score = 50;
+
+  // Account age
+  const accountAgeDays = (Date.now() - member.user.createdTimestamp) / 86400000;
+  if (accountAgeDays > 730) score += 15;
+  else if (accountAgeDays > 365) score += 10;
+  else if (accountAgeDays > 90) score += 5;
+  else if (accountAgeDays < 7) score -= 10;
+
+  // Time in server
+  const joinDays = member.joinedTimestamp ? (Date.now() - member.joinedTimestamp) / 86400000 : 0;
+  if (joinDays > 365) score += 15;
+  else if (joinDays > 90) score += 10;
+  else if (joinDays > 30) score += 5;
+  else if (joinDays < 1) score -= 5;
+
+  // Message activity
+  const messages = trustData?.messageCount || 0;
+  if (messages > 1000) score += 10;
+  else if (messages > 100) score += 7;
+  else if (messages > 10) score += 3;
+
+  // Server booster
+  if (member.premiumSince) score += 10;
+
+  // Has multiple roles (shows integration)
+  const roleCount = member.roles.cache.size - 1;
+  if (roleCount >= 3) score += 5;
+
+  // Warnings
+  const warnings = trustData?.warningCount || 0;
+  score -= Math.min(warnings * 10, 30);
+
+  // Flags (alt detection / risk flags)
+  const flags = trustData?.flagCount || 0;
+  score -= Math.min(flags * 15, 30);
+
+  // Quarantine history
+  const quarantines = trustData?.quarantineCount || 0;
+  if (quarantines > 0) score -= 20;
+
+  score = Math.max(0, Math.min(100, score));
+
+  let label, color;
+  if (score >= 80) { label = 'Trusted'; color = 0x00C853; }
+  else if (score >= 60) { label = 'Good Standing'; color = 0x69F0AE; }
+  else if (score >= 40) { label = 'Neutral'; color = 0xFFD600; }
+  else if (score >= 20) { label = 'Caution'; color = 0xFF6D00; }
+  else { label = 'Low Trust'; color = 0xD50000; }
+
+  return { score, label, color };
 }
 
 // Helper function to get server config
@@ -1014,6 +1148,67 @@ client.on('messageCreate', async message => {
       { upsert: true }
     ).catch(err => console.error('Activity log error:', err));
 
+    // Trust score: track message activity
+    MemberTrustModel.findOneAndUpdate(
+      { guildId: message.guild.id, userId: message.author.id },
+      { $inc: { messageCount: 1 }, $set: { lastActiveAt: new Date() } },
+      { upsert: true, setDefaultsOnInsert: true }
+    ).catch(err => console.error('Trust log error:', err));
+
+    // Suspicious mention velocity detection
+    if (message.mentions.users.size > 0) {
+      (async () => {
+        try {
+          const trackKey = `${message.guild.id}_${message.author.id}`;
+          const now = Date.now();
+          const windowStart = now - MENTION_WINDOW_MS;
+
+          let tracked = mentionTracker.get(trackKey) || [];
+          tracked = tracked.filter(m => m.timestamp > windowStart);
+
+          for (const [id, user] of message.mentions.users) {
+            if (id === message.author.id || user.bot) continue;
+            if (!tracked.some(m => m.mentionedId === id)) {
+              tracked.push({ mentionedId: id, timestamp: now });
+            }
+          }
+          mentionTracker.set(trackKey, tracked);
+
+          const uniqueCount = new Set(tracked.map(m => m.mentionedId)).size;
+          if (uniqueCount >= MENTION_ALERT_THRESHOLD) {
+            const trustData = await MemberTrustModel.findOne({ guildId: message.guild.id, userId: message.author.id });
+            const trust = calculateTrustScore(message.member, trustData);
+            if (trust.score < 60) {
+              const config = await ServerConfigModel.findOne({ guildId: message.guild.id });
+              if (config?.modLogsChannel) {
+                const alertChannel = message.guild.channels.cache.get(config.modLogsChannel);
+                if (alertChannel) {
+                  const alertEmbed = new EmbedBuilder()
+                    .setTitle('Suspicious Mention Velocity')
+                    .setColor(0xFF4444)
+                    .setDescription(`A low-trust member has rapidly mentioned **${uniqueCount} unique users** within the last 10 minutes. This may indicate phishing or mass DM solicitation.`)
+                    .addFields(
+                      { name: 'User', value: `${message.author.tag}\n\`${message.author.id}\``, inline: true },
+                      { name: 'Trust Score', value: `${trust.label} (${trust.score}/100)`, inline: true },
+                      { name: 'Unique Users Mentioned', value: `${uniqueCount} in last 10 min`, inline: true },
+                      { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+                      { name: 'Message', value: `[Jump to message](${message.url})`, inline: true }
+                    )
+                    .setFooter({ text: 'Izumi  •  Mention Velocity Monitor' })
+                    .setTimestamp();
+                  await alertChannel.send({ embeds: [alertEmbed] }).catch(console.error);
+                  // Reset tracker so alert doesn't fire again until next threshold breach
+                  mentionTracker.set(trackKey, []);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          console.error('Mention tracker error:', err);
+        }
+      })();
+    }
+
     // Advanced content restriction enforcement
     const handled = await checkAdvancedRestrictions(message);
     if (handled) return;
@@ -1589,6 +1784,10 @@ client.on('interactionCreate', async interaction => {
       const riskColors = { Critical: 0x8B0000, High: 0xFF0000, Medium: 0xFFA500, Low: 0xFFFF00, Minimal: 0x00FF00 };
       const embedColor = riskColors[risk.label] || 0x5865F2;
 
+      // Trust score
+      const trustData = member ? await MemberTrustModel.findOne({ guildId: interaction.guild.id, userId: target.id }) : null;
+      const trust = member ? calculateTrustScore(member, trustData) : null;
+
       // Permission level in this server
       let permLevel = 'Not in server';
       if (member) {
@@ -1616,6 +1815,9 @@ client.on('interactionCreate', async interaction => {
           { name: 'Badges', value: badges, inline: true },
           { name: 'Nitro Signs', value: nitroSigns.length > 0 ? nitroSigns.join('\n') : 'None detected', inline: true },
           { name: 'Risk Snapshot', value: `**${risk.label}** (${risk.score}/100)`, inline: true }
+        )
+        .addFields(
+          { name: 'Trust Score', value: trust ? `**${trust.label}** (${trust.score}/100)` : 'Not in server', inline: true }
         );
 
       if (member) {
@@ -1665,6 +1867,181 @@ client.on('interactionCreate', async interaction => {
       );
 
       return interaction.editReply({ embeds: [embed], components: [buttons] });
+    }
+
+    if (commandName === 'trust') {
+      const target = interaction.options.getUser('user');
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+
+      if (!member) {
+        return interaction.reply({ content: 'That user is not in this server.', ephemeral: true });
+      }
+
+      await interaction.deferReply();
+
+      const trustData = await MemberTrustModel.findOne({ guildId: interaction.guild.id, userId: target.id });
+      const trust = calculateTrustScore(member, trustData);
+
+      const accountAgeDays = Math.floor((Date.now() - target.createdTimestamp) / 86400000);
+      const joinDays = Math.floor((Date.now() - member.joinedTimestamp) / 86400000);
+
+      const trustBar = (() => {
+        const filled = Math.round(trust.score / 10);
+        return '█'.repeat(filled) + '░'.repeat(10 - filled) + ` ${trust.score}/100`;
+      })();
+
+      const breakdownLines = [];
+      breakdownLines.push(`Account age: ${accountAgeDays} days`);
+      breakdownLines.push(`In server: ${joinDays} days`);
+      breakdownLines.push(`Messages tracked: ${trustData?.messageCount ?? 0}`);
+      if (member.premiumSince) breakdownLines.push('Server booster');
+      const roleCount = member.roles.cache.size - 1;
+      if (roleCount >= 3) breakdownLines.push(`Has ${roleCount} roles`);
+      if (trustData?.warningCount) breakdownLines.push(`Warnings: ${trustData.warningCount}`);
+      if (trustData?.flagCount) breakdownLines.push(`Alt/risk flags: ${trustData.flagCount}`);
+      if (trustData?.quarantineCount) breakdownLines.push(`Quarantine history: ${trustData.quarantineCount}`);
+
+      const embed = new EmbedBuilder()
+        .setTitle(`Trust Score: ${target.username}`)
+        .setColor(trust.color)
+        .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 256 }))
+        .addFields(
+          { name: 'Verdict', value: `**${trust.label}**`, inline: true },
+          { name: 'Score', value: trustBar, inline: false },
+          { name: 'Score Breakdown', value: breakdownLines.join('\n'), inline: false }
+        )
+        .setFooter({ text: `Checked by ${interaction.user.tag}  •  Izumi Trust System` })
+        .setTimestamp();
+
+      return interaction.editReply({ embeds: [embed] });
+    }
+
+    if (commandName === 'warn') {
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+
+      if (!member) return interaction.reply({ content: 'That user is not in this server.', ephemeral: true });
+      if (isAdmin(member)) return interaction.reply({ content: 'You cannot warn an administrator.', ephemeral: true });
+      if (target.id === interaction.user.id) return interaction.reply({ content: 'You cannot warn yourself.', ephemeral: true });
+
+      await interaction.deferReply();
+
+      const warnId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+      await WarnModel.create({
+        guildId: interaction.guild.id,
+        userId: target.id,
+        warnedBy: interaction.user.id,
+        reason,
+        warnId
+      });
+
+      await MemberTrustModel.findOneAndUpdate(
+        { guildId: interaction.guild.id, userId: target.id },
+        { $inc: { warningCount: 1 } },
+        { upsert: true, setDefaultsOnInsert: true }
+      );
+
+      const totalWarnings = await WarnModel.countDocuments({ guildId: interaction.guild.id, userId: target.id });
+
+      const warnEmbed = new EmbedBuilder()
+        .setTitle('Warning Issued')
+        .setColor(0xFFD600)
+        .setThumbnail(target.displayAvatarURL({ dynamic: true }))
+        .addFields(
+          { name: 'Member', value: `${target.tag}\n\`${target.id}\``, inline: true },
+          { name: 'Moderator', value: `${interaction.user.tag}`, inline: true },
+          { name: 'Total Warnings', value: `${totalWarnings}`, inline: true },
+          { name: 'Reason', value: reason, inline: false },
+          { name: 'Warning ID', value: `\`${warnId}\``, inline: false }
+        )
+        .setTimestamp();
+
+      await sendModLog(interaction.guild, warnEmbed);
+
+      const dmEmbed = new EmbedBuilder()
+        .setTitle(`You have received a warning in ${interaction.guild.name}`)
+        .setColor(0xFFD600)
+        .addFields(
+          { name: 'Reason', value: reason, inline: false },
+          { name: 'Issued by', value: interaction.user.tag, inline: true },
+          { name: 'Total Warnings', value: `${totalWarnings}`, inline: true }
+        )
+        .setTimestamp();
+
+      await target.send({ embeds: [dmEmbed] }).catch(() => {});
+
+      return interaction.editReply({ embeds: [warnEmbed] });
+    }
+
+    if (commandName === 'warnings') {
+      const target = interaction.options.getUser('user');
+      await interaction.deferReply();
+
+      const warns = await WarnModel.find({ guildId: interaction.guild.id, userId: target.id }).sort({ timestamp: -1 });
+
+      if (warns.length === 0) {
+        return interaction.editReply({ content: `**${target.tag}** has no warnings on record.` });
+      }
+
+      const warnLines = warns.map((w, i) => {
+        const mod = `<@${w.warnedBy}>`;
+        const time = `<t:${Math.floor(new Date(w.timestamp).getTime() / 1000)}:D>`;
+        return `**${i + 1}.** \`${w.warnId}\` — ${w.reason}\n    by ${mod} on ${time}`;
+      }).join('\n\n');
+
+      const embed = new EmbedBuilder()
+        .setTitle(`Warnings: ${target.tag}`)
+        .setColor(0xFFD600)
+        .setThumbnail(target.displayAvatarURL({ dynamic: true }))
+        .setDescription(warnLines.slice(0, 4000))
+        .setFooter({ text: `${warns.length} warning${warns.length !== 1 ? 's' : ''} total  •  Use /clearwarn <id> to remove one` })
+        .setTimestamp();
+
+      return interaction.editReply({ embeds: [embed] });
+    }
+
+    if (commandName === 'clearwarn') {
+      const warnId = interaction.options.getString('warnid').trim();
+      await interaction.deferReply({ ephemeral: true });
+
+      const warn = await WarnModel.findOneAndDelete({ guildId: interaction.guild.id, warnId });
+
+      if (!warn) {
+        return interaction.editReply({ content: `No warning found with ID \`${warnId}\` in this server.` });
+      }
+
+      await MemberTrustModel.findOneAndUpdate(
+        { guildId: interaction.guild.id, userId: warn.userId },
+        [{ $set: { warningCount: { $max: [0, { $subtract: ['$warningCount', 1] }] } } }]
+      );
+
+      const remaining = await WarnModel.countDocuments({ guildId: interaction.guild.id, userId: warn.userId });
+
+      return interaction.editReply({
+        content: `Warning \`${warnId}\` removed. <@${warn.userId}> now has **${remaining}** warning${remaining !== 1 ? 's' : ''} remaining.`
+      });
+    }
+
+    if (commandName === 'clearwarnings') {
+      const target = interaction.options.getUser('user');
+      await interaction.deferReply({ ephemeral: true });
+
+      const result = await WarnModel.deleteMany({ guildId: interaction.guild.id, userId: target.id });
+
+      if (result.deletedCount === 0) {
+        return interaction.editReply({ content: `**${target.tag}** has no warnings to clear.` });
+      }
+
+      await MemberTrustModel.findOneAndUpdate(
+        { guildId: interaction.guild.id, userId: target.id },
+        { $set: { warningCount: 0 } }
+      );
+
+      return interaction.editReply({
+        content: `Cleared **${result.deletedCount}** warning${result.deletedCount !== 1 ? 's' : ''} from **${target.tag}**. Their trust score will reflect this.`
+      });
     }
 
     if (commandName === 'kick') {
