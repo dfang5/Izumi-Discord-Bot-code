@@ -92,6 +92,16 @@ const WarnSchema = new mongoose.Schema({
 WarnSchema.index({ guildId: 1, userId: 1 });
 const WarnModel = mongoose.model('IzumiWarn', WarnSchema);
 
+const WatchlistSchema = new mongoose.Schema({
+  guildId: { type: String, required: true },
+  userId: { type: String, required: true },
+  addedBy: { type: String, required: true },
+  reason: { type: String, default: 'No reason provided' },
+  addedAt: { type: Date, default: Date.now }
+});
+WatchlistSchema.index({ guildId: 1, userId: 1 }, { unique: true });
+const WatchlistModel = mongoose.model('IzumiWatchlist', WatchlistSchema);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -119,6 +129,9 @@ const snipeReactionCache = new Map(); // channelId -> { user, emoji, messageCont
 const mentionTracker = new Map();
 const MENTION_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const MENTION_ALERT_THRESHOLD = 5;        // unique users mentioned before alert fires
+
+// In-memory watchlist cache: guildId -> Set<userId>
+const watchlistCache = new Map();
 
 // Slash command definitions
 const commands = [
@@ -416,6 +429,34 @@ const commands = [
         .setDescription('The member to clear')
         .setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('watch')
+    .setDescription('Place a user under silent observation — deleted messages, edits, and reactions are auto-logged')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The member to watch')
+        .setRequired(true))
+    .addStringOption(option =>
+      option.setName('reason')
+        .setDescription('Reason for watching this user')
+        .setRequired(false))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('unwatch')
+    .setDescription('Remove a user from the watchlist')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('The member to unwatch')
+        .setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
+  new SlashCommandBuilder()
+    .setName('watchlist')
+    .setDescription('Show all currently watched users in this server')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+
 ];
 
 // Helper functions for permissions
@@ -480,6 +521,17 @@ function calculateTrustScore(member, trustData) {
   else { label = 'Low Trust'; color = 0xD50000; }
 
   return { score, label, color };
+}
+
+// Watchlist cache helper — lazy-loads from DB on first use per guild
+async function isWatched(guildId, userId) {
+  let cached = watchlistCache.get(guildId);
+  if (!cached) {
+    const docs = await WatchlistModel.find({ guildId }).lean().catch(() => []);
+    cached = new Set(docs.map(d => d.userId));
+    watchlistCache.set(guildId, cached);
+  }
+  return cached.has(userId);
 }
 
 // Helper function to get server config
@@ -2043,6 +2095,68 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
+    if (commandName === 'watch') {
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+
+      if (target.id === interaction.user.id) return interaction.reply({ content: 'You cannot watch yourself.', ephemeral: true });
+      if (target.bot) return interaction.reply({ content: 'You cannot watch a bot.', ephemeral: true });
+
+      await interaction.deferReply({ ephemeral: true });
+
+      await WatchlistModel.findOneAndUpdate(
+        { guildId: interaction.guild.id, userId: target.id },
+        { guildId: interaction.guild.id, userId: target.id, addedBy: interaction.user.id, reason, addedAt: new Date() },
+        { upsert: true, new: true }
+      );
+
+      if (!watchlistCache.has(interaction.guild.id)) watchlistCache.set(interaction.guild.id, new Set());
+      watchlistCache.get(interaction.guild.id).add(target.id);
+
+      return interaction.editReply({
+        content: `**${target.tag}** is now being watched. Their deleted messages, edits, and reactions will be automatically logged.`
+      });
+    }
+
+    if (commandName === 'unwatch') {
+      const target = interaction.options.getUser('user');
+      await interaction.deferReply({ ephemeral: true });
+
+      const result = await WatchlistModel.deleteOne({ guildId: interaction.guild.id, userId: target.id });
+
+      if (result.deletedCount === 0) {
+        return interaction.editReply({ content: `**${target.tag}** is not on the watchlist.` });
+      }
+
+      if (watchlistCache.has(interaction.guild.id)) watchlistCache.get(interaction.guild.id).delete(target.id);
+
+      return interaction.editReply({ content: `**${target.tag}** has been removed from the watchlist.` });
+    }
+
+    if (commandName === 'watchlist') {
+      await interaction.deferReply();
+
+      const watches = await WatchlistModel.find({ guildId: interaction.guild.id }).sort({ addedAt: -1 });
+
+      if (watches.length === 0) {
+        return interaction.editReply({ content: 'No users are currently being watched in this server.' });
+      }
+
+      const lines = watches.map((w, i) => {
+        const time = `<t:${Math.floor(new Date(w.addedAt).getTime() / 1000)}:R>`;
+        return `**${i + 1}.** <@${w.userId}> \`${w.userId}\`\n    Added by <@${w.addedBy}> ${time}\n    Reason: ${w.reason}`;
+      }).join('\n\n');
+
+      const embed = new EmbedBuilder()
+        .setTitle(`Watchlist — ${interaction.guild.name}`)
+        .setColor(0xFF6B35)
+        .setDescription(lines.slice(0, 4000))
+        .setFooter({ text: `${watches.length} user${watches.length !== 1 ? 's' : ''} under observation` })
+        .setTimestamp();
+
+      return interaction.editReply({ embeds: [embed] });
+    }
+
     if (commandName === 'kick') {
       const target = interaction.options.getUser('user');
       const reason = interaction.options.getString('reason') || 'No reason provided';
@@ -2963,6 +3077,17 @@ client.on('messageDelete', async message => {
     });
   }
 
+  // Watchlist: auto-log deleted messages for watched users
+  if (message.guild && message.author && await isWatched(message.guild.id, message.author.id)) {
+    const content = message.content || '';
+    const attachments = [...message.attachments.values()];
+    let text = `<@${message.author.id}>: ${content || '*[no text content]*'}`;
+    if (attachments.length > 0) {
+      text += '\n' + attachments.map(a => `[${a.name}](${a.url})`).join('\n');
+    }
+    message.channel.send(text).catch(console.error);
+  }
+
   const config = getServerConfig(message.guild.id);
   if (!config.deletedLogsChannel) return;
 
@@ -3020,6 +3145,21 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
       messageUrl: newMessage.url,
       editedAt: Date.now()
     });
+  }
+
+  // Watchlist: auto-log edits for watched users
+  if (newMessage.guild && newMessage.author && await isWatched(newMessage.guild.id, newMessage.author.id)) {
+    const watchEmbed = new EmbedBuilder()
+      .setColor(0xFFA500)
+      .setAuthor({ name: `${newMessage.author.tag}`, iconURL: newMessage.author.displayAvatarURL({ dynamic: true }) })
+      .addFields(
+        { name: 'Before', value: (oldMessage.content || '*[empty]*').slice(0, 512), inline: false },
+        { name: 'After', value: (newMessage.content || '*[empty]*').slice(0, 512), inline: false },
+        { name: 'Jump to Message', value: `[Click here](${newMessage.url})`, inline: true }
+      )
+      .setFooter({ text: `Edited Message  •  ${newMessage.author.id}` })
+      .setTimestamp();
+    newMessage.channel.send({ embeds: [watchEmbed] }).catch(console.error);
   }
 
   const config = getServerConfig(newMessage.guild.id);
@@ -3084,6 +3224,17 @@ client.on('messageReactionAdd', async (reaction, user) => {
     }
   }
 
+  // Watchlist: auto-log reactions added by watched users
+  if (reaction.message.guild && await isWatched(reaction.message.guild.id, user.id)) {
+    const watchEmbed = new EmbedBuilder()
+      .setColor(0x57F287)
+      .setAuthor({ name: `${user.tag}`, iconURL: user.displayAvatarURL({ dynamic: true }) })
+      .setDescription(`<@${user.id}> added reaction **${reaction.emoji}** to [this message](${reaction.message.url})`)
+      .setFooter({ text: `Reaction Added  •  ${user.id}` })
+      .setTimestamp();
+    reaction.message.channel.send({ embeds: [watchEmbed] }).catch(console.error);
+  }
+
   const config = getServerConfig(reaction.message.guild.id);
   if (!config.reactionLogsChannel) return;
 
@@ -3146,6 +3297,17 @@ client.on('messageReactionRemove', async (reaction, user) => {
       messageAuthorTag: reaction.message.author?.tag || 'Unknown',
       removedAt: Date.now()
     });
+  }
+
+  // Watchlist: auto-log reactions removed by watched users
+  if (reaction.message.guild && await isWatched(reaction.message.guild.id, user.id)) {
+    const watchEmbed = new EmbedBuilder()
+      .setColor(0xFF4444)
+      .setAuthor({ name: `${user.tag}`, iconURL: user.displayAvatarURL({ dynamic: true }) })
+      .setDescription(`<@${user.id}> removed reaction **${reaction.emoji}** from [this message](${reaction.message.url})`)
+      .setFooter({ text: `Reaction Removed  •  ${user.id}` })
+      .setTimestamp();
+    reaction.message.channel.send({ embeds: [watchEmbed] }).catch(console.error);
   }
 
   const config = getServerConfig(reaction.message.guild.id);
