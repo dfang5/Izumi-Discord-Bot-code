@@ -17,6 +17,7 @@ const ServerConfigSchema = new mongoose.Schema({
   deletedLogsChannel: { type: String, default: null },
   editLogsChannel: { type: String, default: null },
   modLogsChannel: { type: String, default: null },
+  watchLogChannel: { type: String, default: null },
   warnDeleteTimeout: { type: Number, default: 60 },
   quarantine: {
     enabled: { type: Boolean, default: false },
@@ -457,6 +458,14 @@ const commands = [
     .setDescription('Show all currently watched users in this server')
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
+  new SlashCommandBuilder()
+    .setName('setwatchlog')
+    .setDescription('Set the channel where watchlist edits and reactions are logged (privately)')
+    .addChannelOption(option =>
+      option.setName('channel')
+        .setDescription('The channel to post watch logs to')
+        .setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ];
 
 // Helper functions for permissions
@@ -542,6 +551,7 @@ function getServerConfig(guildId) {
       deletedLogsChannel: null,
       editLogsChannel: null,
       modLogsChannel: null,
+      watchLogChannel: null,
       warnDeleteTimeout: 60,
       quarantine: {
         enabled: false,
@@ -835,6 +845,7 @@ async function loadAllConfigs() {
         deletedLogsChannel: doc.deletedLogsChannel ?? null,
         editLogsChannel: doc.editLogsChannel ?? null,
         modLogsChannel: doc.modLogsChannel ?? null,
+        watchLogChannel: doc.watchLogChannel ?? null,
         warnDeleteTimeout: doc.warnDeleteTimeout !== undefined ? doc.warnDeleteTimeout : 60,
         quarantine: {
           enabled: doc.quarantine?.enabled ?? false,
@@ -2157,6 +2168,22 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply({ embeds: [embed] });
     }
 
+    if (commandName === 'setwatchlog') {
+      const channel = interaction.options.getChannel('channel');
+      await interaction.deferReply({ ephemeral: true });
+
+      await ServerConfigModel.findOneAndUpdate(
+        { guildId: interaction.guild.id },
+        { $set: { watchLogChannel: channel.id } },
+        { upsert: true }
+      );
+
+      const cfg = getServerConfig(interaction.guild.id);
+      cfg.watchLogChannel = channel.id;
+
+      return interaction.editReply({ content: `Watch logs for edits and reactions will now be posted in ${channel}.` });
+    }
+
     if (commandName === 'kick') {
       const target = interaction.options.getUser('user');
       const reason = interaction.options.getString('reason') || 'No reason provided';
@@ -3147,19 +3174,26 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     });
   }
 
-  // Watchlist: auto-log edits for watched users
+  // Watchlist: auto-log edits for watched users (private watch log channel)
   if (newMessage.guild && newMessage.author && await isWatched(newMessage.guild.id, newMessage.author.id)) {
-    const watchEmbed = new EmbedBuilder()
-      .setColor(0xFFA500)
-      .setAuthor({ name: `${newMessage.author.tag}`, iconURL: newMessage.author.displayAvatarURL({ dynamic: true }) })
-      .addFields(
-        { name: 'Before', value: (oldMessage.content || '*[empty]*').slice(0, 512), inline: false },
-        { name: 'After', value: (newMessage.content || '*[empty]*').slice(0, 512), inline: false },
-        { name: 'Jump to Message', value: `[Click here](${newMessage.url})`, inline: true }
-      )
-      .setFooter({ text: `Edited Message  •  ${newMessage.author.id}` })
-      .setTimestamp();
-    newMessage.channel.send({ embeds: [watchEmbed] }).catch(console.error);
+    const watchCfg = getServerConfig(newMessage.guild.id);
+    if (watchCfg.watchLogChannel) {
+      const watchLog = newMessage.guild.channels.cache.get(watchCfg.watchLogChannel);
+      if (watchLog) {
+        const watchEmbed = new EmbedBuilder()
+          .setColor(0xFFA500)
+          .setAuthor({ name: `${newMessage.author.tag}`, iconURL: newMessage.author.displayAvatarURL({ dynamic: true }) })
+          .addFields(
+            { name: 'Before', value: (oldMessage.content || '*[empty]*').slice(0, 512), inline: false },
+            { name: 'After', value: (newMessage.content || '*[empty]*').slice(0, 512), inline: false },
+            { name: 'Channel', value: `<#${newMessage.channel.id}>`, inline: true },
+            { name: 'Jump to Message', value: `[Click here](${newMessage.url})`, inline: true }
+          )
+          .setFooter({ text: `Watchlist  •  Edited Message  •  ${newMessage.author.id}` })
+          .setTimestamp();
+        watchLog.send({ embeds: [watchEmbed] }).catch(console.error);
+      }
+    }
   }
 
   const config = getServerConfig(newMessage.guild.id);
@@ -3224,15 +3258,25 @@ client.on('messageReactionAdd', async (reaction, user) => {
     }
   }
 
-  // Watchlist: auto-log reactions added by watched users
+  // Watchlist: auto-log reactions added by watched users (private watch log channel)
   if (reaction.message.guild && await isWatched(reaction.message.guild.id, user.id)) {
-    const watchEmbed = new EmbedBuilder()
-      .setColor(0x57F287)
-      .setAuthor({ name: `${user.tag}`, iconURL: user.displayAvatarURL({ dynamic: true }) })
-      .setDescription(`<@${user.id}> added reaction **${reaction.emoji}** to [this message](${reaction.message.url})`)
-      .setFooter({ text: `Reaction Added  •  ${user.id}` })
-      .setTimestamp();
-    reaction.message.channel.send({ embeds: [watchEmbed] }).catch(console.error);
+    const watchCfg = getServerConfig(reaction.message.guild.id);
+    if (watchCfg.watchLogChannel) {
+      const watchLog = reaction.message.guild.channels.cache.get(watchCfg.watchLogChannel);
+      if (watchLog) {
+        const watchEmbed = new EmbedBuilder()
+          .setColor(0x57F287)
+          .setAuthor({ name: `${user.tag}`, iconURL: user.displayAvatarURL({ dynamic: true }) })
+          .setDescription(`<@${user.id}> added reaction **${reaction.emoji}** to [this message](${reaction.message.url})`)
+          .addFields(
+            { name: 'Channel', value: `<#${reaction.message.channel.id}>`, inline: true },
+            { name: 'Message Content', value: (reaction.message.content || '*[no content]*').slice(0, 256), inline: false }
+          )
+          .setFooter({ text: `Watchlist  •  Reaction Added  •  ${user.id}` })
+          .setTimestamp();
+        watchLog.send({ embeds: [watchEmbed] }).catch(console.error);
+      }
+    }
   }
 
   const config = getServerConfig(reaction.message.guild.id);
@@ -3299,15 +3343,25 @@ client.on('messageReactionRemove', async (reaction, user) => {
     });
   }
 
-  // Watchlist: auto-log reactions removed by watched users
+  // Watchlist: auto-log reactions removed by watched users (private watch log channel)
   if (reaction.message.guild && await isWatched(reaction.message.guild.id, user.id)) {
-    const watchEmbed = new EmbedBuilder()
-      .setColor(0xFF4444)
-      .setAuthor({ name: `${user.tag}`, iconURL: user.displayAvatarURL({ dynamic: true }) })
-      .setDescription(`<@${user.id}> removed reaction **${reaction.emoji}** from [this message](${reaction.message.url})`)
-      .setFooter({ text: `Reaction Removed  •  ${user.id}` })
-      .setTimestamp();
-    reaction.message.channel.send({ embeds: [watchEmbed] }).catch(console.error);
+    const watchCfg = getServerConfig(reaction.message.guild.id);
+    if (watchCfg.watchLogChannel) {
+      const watchLog = reaction.message.guild.channels.cache.get(watchCfg.watchLogChannel);
+      if (watchLog) {
+        const watchEmbed = new EmbedBuilder()
+          .setColor(0xFF4444)
+          .setAuthor({ name: `${user.tag}`, iconURL: user.displayAvatarURL({ dynamic: true }) })
+          .setDescription(`<@${user.id}> removed reaction **${reaction.emoji}** from [this message](${reaction.message.url})`)
+          .addFields(
+            { name: 'Channel', value: `<#${reaction.message.channel.id}>`, inline: true },
+            { name: 'Message Content', value: (reaction.message.content || '*[no content]*').slice(0, 256), inline: false }
+          )
+          .setFooter({ text: `Watchlist  •  Reaction Removed  •  ${user.id}` })
+          .setTimestamp();
+        watchLog.send({ embeds: [watchEmbed] }).catch(console.error);
+      }
+    }
   }
 
   const config = getServerConfig(reaction.message.guild.id);
