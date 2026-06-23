@@ -37,6 +37,10 @@ const ActiveTicketSchema = new mongoose.Schema({
 });
 const ActiveTicketModel = mongoose.model('IzumiActiveTicket', ActiveTicketSchema);
 
+// Per-user ticket creation cooldown (in-memory — intentionally resets on restart)
+const ticketCooldowns = new Map();
+const TICKET_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+
 // DB-backed setup state — survives bot restarts and redeployments
 const TicketSetupStateSchema = new mongoose.Schema({
   guildId: { type: String, required: true, unique: true },
@@ -643,6 +647,33 @@ async function handleTicketInteraction(interaction) {
       await interaction.reply({ content: 'The ticket system is not properly configured for this server.', ephemeral: false });
       return true;
     }
+
+    // One open ticket per user
+    const existingTicket = await ActiveTicketModel.findOne({ guildId, creatorId: interaction.user.id });
+    if (existingTicket) {
+      await interaction.reply({
+        content: `You already have an open ticket: <#${existingTicket.channelId}>. Please continue there, or ask staff to close it before opening a new one.`,
+        ephemeral: true
+      });
+      return true;
+    }
+
+    // Cooldown — 10 minutes between ticket creations
+    const cooldownKey = `${guildId}_${interaction.user.id}`;
+    const now = Date.now();
+    const lastCreated = ticketCooldowns.get(cooldownKey);
+    if (lastCreated && now - lastCreated < TICKET_COOLDOWN_MS) {
+      const remaining = Math.ceil((TICKET_COOLDOWN_MS - (now - lastCreated)) / 1000);
+      const mins = Math.floor(remaining / 60);
+      const secs = remaining % 60;
+      const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+      await interaction.reply({
+        content: `You're creating tickets too quickly. Please wait **${timeStr}** before trying again.`,
+        ephemeral: true
+      });
+      return true;
+    }
+    ticketCooldowns.set(cooldownKey, now);
 
     await interaction.deferReply({ ephemeral: false });
 
